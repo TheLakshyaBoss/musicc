@@ -263,7 +263,7 @@ function AppContent() {
 
     if (!currentTrack?.cover) return;
     const coverUrl = encodeURI(`${HF_BASE_URL}/${currentTrack.cover}`);
-
+    
     ImageManipulator.manipulateAsync(coverUrl, [{ resize: { width: 64 } }], {
       base64: true,
       compress: 0.6,
