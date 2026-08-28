@@ -1,0 +1,1 @@
+Musicc is just an app that provides similar UI to spotify as I was using spotify for a long time but I dont want to get subscription and also dont want to listen to annoying ads. So I just downloaded all of my music and uploaded it to a hugging face bucket and I am simply just streaming the audio files with an api fetch.
