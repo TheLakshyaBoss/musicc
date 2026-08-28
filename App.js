@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import {
   StyleSheet,
   Text,
@@ -29,22 +29,6 @@ import {
   Poppins_700Bold,
 } from '@expo-google-fonts/poppins';
 
-// NOTE: this file depends on three extra Expo packages that aren't in the
-// original project. Install them before running:
-//   npx expo install expo-linear-gradient
-//   npx expo install react-native-webview
-//   npx expo install expo-image-manipulator
-// Color extraction has two steps, both deliberately avoiding anything that
-// depends on the cover's server sending CORS headers (Hugging Face's CDN
-// doesn't reliably do this, which is what silently broke it before):
-//   1. expo-image-manipulator does a *native* download + resize of the
-//      cover (not a browser fetch, so CORS is irrelevant) and hands back a
-//      small base64 image.
-//   2. That base64 is embedded directly as a `data:` URI inside a tiny
-//      invisible WebView running an HTML5 canvas. Canvases can always read
-//      pixels from a `data:` URI regardless of origin, so there's nothing
-//      left to taint.
-
 const HF_BASE_URL = 'https://huggingface.co/datasets/lakshya1234/my-audio-app/resolve/main';
 
 const COLORS = {
@@ -61,16 +45,19 @@ const COLORS = {
 };
 
 const { width: SCREEN_W } = Dimensions.get('window');
-const SEEK_BAR_WIDTH = SCREEN_W - 48;
+const ITEM_HEIGHT = 68;
 const LYRIC_BOX_HEIGHT = 220;
 const LINE_HEIGHT_SLOT = 70;
-
-// A track can't be replayed until at least this many other songs have
-// played since it was last heard ("too rare to repeat within 5 songs").
 const NO_REPEAT_WINDOW = 5;
-// How many recently-heard ids we actually remember (a little more than the
-// no-repeat window so the pool stays healthy even with small libraries).
 const RECENT_HISTORY_LIMIT = 12;
+const INITIAL_VISIBLE_COUNT = 10;
+const FILTER_GENRES = ['all', 'aura', 'love', 'sad', 'happy'];
+const DEFAULT_ACCENT = '#535353';
+
+// Polished spacing for 3x3 Speed Dial layout
+const TILE_GAP = 14;
+const PADDING_H = 18;
+const TILE_WIDTH = (SCREEN_W - PADDING_H * 2 - TILE_GAP * 2) / 3;
 
 export default function App() {
   return (
@@ -80,6 +67,91 @@ export default function App() {
   );
 }
 
+const TrackRowItem = memo(({ item, isSelected, isPlaying, onSelect }) => {
+  return (
+    <TouchableOpacity
+      activeOpacity={0.6}
+      style={styles.trackRow}
+      onPress={() => onSelect(item.id)}
+    >
+      {item.cover ? (
+        <Image
+          source={{ uri: `${HF_BASE_URL}/${item.cover}` }}
+          style={styles.trackCoverImage}
+        />
+      ) : (
+        <View style={styles.trackArt}>
+          <Text style={styles.trackArtGlyph}>♪</Text>
+        </View>
+      )}
+      <View style={{ flex: 1, marginLeft: 12 }}>
+        <Text numberOfLines={1} style={[styles.trackTitle, isSelected && styles.trackTitleActive]}>
+          {item.title}
+        </Text>
+        <Text numberOfLines={1} style={styles.trackSubtitle}>
+          {(item.artist || 'Unknown artist') + (item.genre ? ` • ${item.genre}` : '')}
+        </Text>
+      </View>
+      {isSelected && isPlaying && <View style={styles.nowPlayingDot} />}
+    </TouchableOpacity>
+  );
+});
+
+const SpeedDialSection = memo(({ pages, currentTrackId, onSelect }) => {
+  if (!pages.length) return null;
+
+  return (
+    <View style={styles.speedDialContainer}>
+      <View style={styles.headerRow}>
+        <Text style={styles.headerTitle}>Speed dial</Text>
+      </View>
+      <ScrollView
+        horizontal
+        pagingEnabled
+        nestedScrollEnabled
+        decelerationRate="fast"
+        showsHorizontalScrollIndicator={false}
+        style={styles.speedDialScroll}
+      >
+        {pages.map((pageTracks, pIdx) => (
+          <View key={pIdx} style={[styles.speedDialPage, { width: SCREEN_W }]}>
+            {pageTracks.map((item) => {
+              const isSelected = currentTrackId === item.id;
+              return (
+                <TouchableOpacity
+                  key={item.id}
+                  activeOpacity={0.7}
+                  style={styles.speedDialTile}
+                  onPress={() => onSelect(item.id)}
+                >
+                  <View style={[styles.speedDialCoverWrapper, isSelected && styles.speedDialCoverActive]}>
+                    {item.cover ? (
+                      <Image
+                        source={{ uri: `${HF_BASE_URL}/${item.cover}` }}
+                        style={styles.speedDialCover}
+                      />
+                    ) : (
+                      <View style={styles.speedDialCoverFallback}>
+                        <Text style={styles.trackArtGlyph}>♪</Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text numberOfLines={1} style={[styles.speedDialTitle, isSelected && styles.trackTitleActive]}>
+                    {item.title}
+                  </Text>
+                  <Text numberOfLines={1} style={styles.speedDialSubtitle}>
+                    {item.artist || 'Unknown artist'}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        ))}
+      </ScrollView>
+    </View>
+  );
+});
+
 function AppContent() {
   const [fontsLoaded] = useFonts({
     Poppins_400Regular,
@@ -88,8 +160,12 @@ function AppContent() {
     Poppins_700Bold,
   });
 
-  const [tracks, setTracks] = useState([]);
+  const [rawTracks, setRawTracks] = useState([]);
+  const [randomizedTracks, setRandomizedTracks] = useState([]);
+  const [speedDialTracks, setSpeedDialTracks] = useState([]);
+  const [selectedGenre, setSelectedGenre] = useState('all');
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [isExpanded, setIsExpanded] = useState(false);
   const [lyrics, setLyrics] = useState([]);
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
   const [loading, setLoading] = useState(true);
@@ -105,21 +181,19 @@ function AppContent() {
   const { width: windowWidth } = useWindowDimensions();
   const insets = useSafeAreaInsets();
 
-  // Ids of recently-played tracks, most-recent last — used to keep smart
-  // "next" picks from repeating a song heard within the last few tracks.
   const recentIdsRef = useRef([]);
-  // Actual navigation history (track indices) so the "previous" button
-  // goes back to what really played, not just index-1.
   const backStackRef = useRef([]);
 
-  const currentTrack = tracks[currentIndex] || null;
-  const audioSource = currentTrack ? `${HF_BASE_URL}/${currentTrack.file}` : '';
+  const currentTrack = rawTracks[currentIndex] || null;
+  const audioSource = useMemo(() => {
+    if (!currentTrack?.file) return '';
+    return `${HF_BASE_URL}/${currentTrack.file}`;
+  }, [currentTrack?.file]);
+
   const player = useAudioPlayer(audioSource);
   const status = useAudioPlayerStatus(player);
 
   useEffect(() => {
-    // interruptionMode must be 'doNotMix' for lock screen / earphone
-    // remote controls to correctly attach to this player (per expo-audio docs).
     setAudioModeAsync({
       playsInSilentMode: true,
       staysActiveInBackground: true,
@@ -132,7 +206,18 @@ function AppContent() {
     fetch(`${HF_BASE_URL}/playlist.json`)
       .then((res) => res.json())
       .then((data) => {
-        setTracks(shuffleArray(data));
+        setRawTracks(data);
+
+        const sortedByNewest = [...data].sort((a, b) => parseInt(b.id, 10) - parseInt(a.id, 10));
+        const latestTrack = sortedByNewest[0];
+        const remainingTracks = data.filter((t) => t.id !== latestTrack?.id);
+
+        const speedDialPicks = latestTrack
+          ? [latestTrack, ...shuffleArray(remainingTracks).slice(0, 26)]
+          : shuffleArray(data).slice(0, 27);
+
+        setSpeedDialTracks(speedDialPicks);
+        setRandomizedTracks(shuffleArray(data));
         setLoading(false);
       })
       .catch((err) => {
@@ -140,6 +225,15 @@ function AppContent() {
         setLoading(false);
       });
   }, []);
+
+  useEffect(() => {
+    if (!rawTracks.length) return;
+    const nextIdx = (currentIndex + 1) % rawTracks.length;
+    const nextTrack = rawTracks[nextIdx];
+    if (nextTrack?.cover) {
+      Image.prefetch(`${HF_BASE_URL}/${nextTrack.cover}`).catch(() => {});
+    }
+  }, [currentIndex, rawTracks]);
 
   useEffect(() => {
     setCurrentLineIndex(-1);
@@ -160,11 +254,6 @@ function AppContent() {
       });
   }, [currentTrack?.id]);
 
-  // Spotify-style theming, in two steps:
-  // 1. Natively download + shrink the cover to a small base64 image (no
-  //    browser fetch involved, so CORS can't break it).
-  // 2. Hand that base64 to a hidden WebView canvas (below) to read out a
-  //    dominant color, via handleColorProbeMessage.
   const [colorProbeDataUri, setColorProbeDataUri] = useState(null);
 
   useEffect(() => {
@@ -173,7 +262,7 @@ function AppContent() {
     setColorProbeDataUri(null);
 
     if (!currentTrack?.cover) return;
-    const coverUrl = `${HF_BASE_URL}/${currentTrack.cover}`;
+    const coverUrl = encodeURI(`${HF_BASE_URL}/${currentTrack.cover}`);
 
     ImageManipulator.manipulateAsync(coverUrl, [{ resize: { width: 64 } }], {
       base64: true,
@@ -222,7 +311,6 @@ function AppContent() {
     return () => clearInterval(fastTimer.current);
   }, [player, seeking, status?.currentTime]);
 
-  // Smooth, jitter-free centering strictly for the preview box
   useEffect(() => {
     if (!lyrics.length) return;
 
@@ -293,52 +381,49 @@ function AppContent() {
     }
   }, [player, status?.isPlaying]);
 
-  // Smart "next": picks the closest-genre track that hasn't played within
-  // the last NO_REPEAT_WINDOW songs, instead of just walking the list order.
   const playNext = useCallback(() => {
-    if (!tracks.length) return;
-    const current = tracks[currentIndex];
+    if (!rawTracks.length) return;
+    const current = rawTracks[currentIndex];
     if (current) {
       recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
       backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
     }
-    const nextIdx = pickSmartNextIndex(tracks, current, recentIdsRef.current);
-    setCurrentIndex(nextIdx >= 0 ? nextIdx : (currentIndex + 1) % tracks.length);
-  }, [tracks, currentIndex]);
+    const nextIdx = pickSmartNextIndex(rawTracks, current, recentIdsRef.current);
+    setCurrentIndex(nextIdx >= 0 ? nextIdx : (currentIndex + 1) % rawTracks.length);
+  }, [rawTracks, currentIndex]);
 
-  // Real "previous": rewinds to whatever actually played before this,
-  // rather than just index-1 in the list.
   const playPrev = useCallback(() => {
-    if (!tracks.length) return;
+    if (!rawTracks.length) return;
     const prevIdx = backStackRef.current.length ? backStackRef.current.pop() : undefined;
     if (prevIdx !== undefined && prevIdx !== currentIndex) {
       setCurrentIndex(prevIdx);
     } else {
-      setCurrentIndex((currentIndex - 1 + tracks.length) % tracks.length);
+      setCurrentIndex((currentIndex - 1 + rawTracks.length) % rawTracks.length);
     }
-  }, [tracks, currentIndex]);
+  }, [rawTracks, currentIndex]);
 
-  const selectTrack = (index) => {
-    if (tracks.length && index !== currentIndex) {
-      const current = tracks[currentIndex];
-      if (current) {
-        recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
-        backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
+  const selectTrackById = useCallback((trackId) => {
+    setRawTracks((currentRaw) => {
+      const targetIdx = currentRaw.findIndex((t) => t.id === trackId);
+      if (targetIdx !== -1) {
+        const current = currentRaw[currentIndex];
+        if (current) {
+          recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
+          backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
+        }
+        setCurrentIndex(targetIdx);
+        setPlayerOpen(true);
       }
-    }
-    setCurrentIndex(index);
-    setPlayerOpen(true);
-  };
+      return currentRaw;
+    });
+  }, [currentIndex]);
 
   const duration = status?.duration || 0;
   const displayTime = seeking ? seekValue : smoothTime;
   const progressPct = duration > 0 ? Math.min(displayTime / duration, 1) : 0;
   const isPlaying = status?.isPlaying ?? player?.playing ?? false;
 
-  // Derived Now Playing theme from the cover's dominant color: a darker
-  // shade for the background wash, and a lighter shade so the active
-  // lyric line still pops against it.
-  const nowPlayingTheme = React.useMemo(() => {
+  const nowPlayingTheme = useMemo(() => {
     const top = darkenColor(dominantColor, 0.45);
     const bottom = darkenColor(dominantColor, 0.88);
     const cardBg = darkenColor(dominantColor, 0.72);
@@ -346,11 +431,36 @@ function AppContent() {
     return { top, bottom, cardBg, highlight };
   }, [dominantColor]);
 
-  // Register this player as the active lock screen / earphone remote
-  // control session, and push metadata for the current track. This is
-  // what makes a single earphone click play/pause, and (where the
-  // installed expo-audio version supports it) a double/triple click
-  // skip forward/back.
+  const speedDialPages = useMemo(() => {
+    if (!speedDialTracks.length) return [];
+    const pages = [];
+    for (let i = 0; i < speedDialTracks.length; i += 9) {
+      pages.push(speedDialTracks.slice(i, i + 9));
+    }
+    return pages;
+  }, [speedDialTracks]);
+
+  const filteredTracks = useMemo(() => {
+    if (selectedGenre === 'all') return randomizedTracks;
+    return randomizedTracks.filter(
+      (t) => (t.genre || '').toLowerCase().trim() === selectedGenre.toLowerCase().trim()
+    );
+  }, [randomizedTracks, selectedGenre]);
+
+  const displayedTracks = useMemo(() => {
+    if (isExpanded) return filteredTracks;
+    return filteredTracks.slice(0, INITIAL_VISIBLE_COUNT);
+  }, [filteredTracks, isExpanded]);
+
+  const handleFilterPress = useCallback((genre) => {
+    if (genre === 'all') {
+      setRandomizedTracks(shuffleArray(rawTracks));
+      setSelectedGenre('all');
+    } else {
+      setSelectedGenre(genre);
+    }
+  }, [rawTracks]);
+
   useEffect(() => {
     if (!player || !status?.isLoaded || !currentTrack) return;
     try {
@@ -371,10 +481,6 @@ function AppContent() {
     }
   }, [player, status?.isLoaded, currentTrack?.id]);
 
-  // Wire up remote next/previous events (earphone double/triple click,
-  // lock screen, notification, Control Center) to the same handlers as
-  // the in-app buttons. Play/pause is handled by expo-audio itself once
-  // this player is set active, so no listener is needed for that.
   useEffect(() => {
     if (!player || typeof player.addListener !== 'function') return;
     const nextSub = player.addListener('onRemoteNextTrack', () => playNext());
@@ -400,6 +506,77 @@ function AppContent() {
     setTimeout(() => setSeeking(false), 150);
   };
 
+  const getItemLayout = useCallback((_, index) => ({
+    length: ITEM_HEIGHT,
+    offset: ITEM_HEIGHT * index,
+    index,
+  }), []);
+
+  const renderItem = useCallback(({ item }) => (
+    <TrackRowItem
+      item={item}
+      isSelected={currentTrack?.id === item.id}
+      isPlaying={isPlaying}
+      onSelect={selectTrackById}
+    />
+  ), [currentTrack?.id, isPlaying, selectTrackById]);
+
+  const listHeader = useMemo(() => (
+    <View>
+      <SpeedDialSection
+        pages={speedDialPages}
+        currentTrackId={currentTrack?.id}
+        onSelect={selectTrackById}
+      />
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.filterBar}
+      >
+        {FILTER_GENRES.map((genre) => {
+          const active = selectedGenre === genre;
+          return (
+            <TouchableOpacity
+              key={genre}
+              activeOpacity={0.8}
+              style={[styles.filterPill, active && styles.filterPillActive]}
+              onPress={() => handleFilterPress(genre)}
+            >
+              <Text style={[styles.filterPillText, active && styles.filterPillTextActive]}>
+                {genre.charAt(0).toUpperCase() + genre.slice(1)}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </ScrollView>
+      <View style={styles.sectionHeaderRow}>
+        <Text style={styles.sectionTitle}>Songs</Text>
+        <Text style={styles.songCountText}>{filteredTracks.length} Total</Text>
+      </View>
+    </View>
+  ), [speedDialPages, currentTrack?.id, selectTrackById, selectedGenre, handleFilterPress, filteredTracks.length]);
+
+  const listFooter = useMemo(() => {
+    if (filteredTracks.length <= INITIAL_VISIBLE_COUNT) return null;
+    return (
+      <TouchableOpacity
+        activeOpacity={0.7}
+        style={styles.seeMoreButton}
+        onPress={() => setIsExpanded((prev) => !prev)}
+      >
+        <Text style={styles.seeMoreText}>
+          {isExpanded ? 'Show Less' : `See More (${filteredTracks.length - INITIAL_VISIBLE_COUNT} More)`}
+        </Text>
+        <Ionicons
+          name={isExpanded ? 'chevron-up' : 'chevron-down'}
+          size={16}
+          color={COLORS.white}
+          style={{ marginLeft: 6 }}
+        />
+      </TouchableOpacity>
+    );
+  }, [filteredTracks.length, isExpanded]);
+
   if (!fontsLoaded || loading) {
     return (
       <View style={[styles.center, { backgroundColor: COLORS.bg }]}>
@@ -413,10 +590,6 @@ function AppContent() {
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
 
-      {/* Hidden color-probe WebView: reads the resized cover (already
-          embedded as a data: URI, so there's no network fetch and no CORS
-          to worry about) and reports its dominant color via onMessage.
-          Remounted (via `key`) whenever the image changes for a fresh read. */}
       {colorProbeHtml && (
         <WebView
           key={colorProbeDataUri}
@@ -431,44 +604,18 @@ function AppContent() {
         />
       )}
 
-      <View style={styles.headerRow}>
-        <Text style={styles.headerTitle}>Your Library</Text>
-      </View>
-
       <FlatList
-        data={tracks}
+        data={displayedTracks}
         keyExtractor={(item) => item.id}
+        renderItem={renderItem}
+        getItemLayout={getItemLayout}
+        ListHeaderComponent={listHeader}
+        ListFooterComponent={listFooter}
+        initialNumToRender={12}
+        maxToRenderPerBatch={10}
+        windowSize={5}
+        removeClippedSubviews={true}
         contentContainerStyle={{ paddingBottom: (currentTrack ? 96 : 20) + insets.bottom }}
-        renderItem={({ item, index }) => {
-          const isSelected = currentTrack?.id === item.id;
-          return (
-            <TouchableOpacity
-              activeOpacity={0.6}
-              style={styles.trackRow}
-              onPress={() => selectTrack(index)}
-            >
-              {item.cover ? (
-                <Image
-                  source={{ uri: `${HF_BASE_URL}/${item.cover}` }}
-                  style={styles.trackCoverImage}
-                />
-              ) : (
-                <View style={styles.trackArt}>
-                  <Text style={styles.trackArtGlyph}>♪</Text>
-                </View>
-              )}
-              <View style={{ flex: 1, marginLeft: 12 }}>
-                <Text numberOfLines={1} style={[styles.trackTitle, isSelected && styles.trackTitleActive]}>
-                  {item.title}
-                </Text>
-                <Text numberOfLines={1} style={styles.trackSubtitle}>
-                  {item.artist || 'Unknown artist'}
-                </Text>
-              </View>
-              {isSelected && isPlaying && <View style={styles.nowPlayingDot} />}
-            </TouchableOpacity>
-          );
-        }}
       />
 
       {/* Mini Player */}
@@ -494,7 +641,9 @@ function AppContent() {
             )}
             <View style={{ flex: 1, marginLeft: 10 }}>
               <Text numberOfLines={1} style={styles.miniTitle}>{currentTrack.title}</Text>
-              <Text numberOfLines={1} style={styles.miniSubtitle}>{currentTrack.artist || 'Unknown artist'}</Text>
+              <Text numberOfLines={1} style={styles.miniSubtitle}>
+                {(currentTrack.artist || 'Unknown artist') + (currentTrack.genre ? ` • ${currentTrack.genre}` : '')}
+              </Text>
             </View>
             <TouchableOpacity onPress={togglePlayPause} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
               <Ionicons name={isPlaying ? 'pause' : 'play'} size={24} color={COLORS.white} />
@@ -509,120 +658,127 @@ function AppContent() {
           colors={[nowPlayingTheme.top, nowPlayingTheme.bottom]}
           style={{ flex: 1 }}
         >
-        <SafeAreaView style={[styles.fullPlayer, { backgroundColor: 'transparent' }]}>
-          <View style={styles.fullPlayerHeader}>
-            <TouchableOpacity
-              onPress={() => setPlayerOpen(false)}
-              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-              style={styles.chevronButton}
-            >
-              <Ionicons name="chevron-down" size={26} color={COLORS.white} />
-            </TouchableOpacity>
-            <Text style={styles.fullPlayerHeaderLabel} numberOfLines={1}>NOW PLAYING</Text>
-            <View style={{ width: 24 }} />
-          </View>
-
-          <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 + insets.bottom }} showsVerticalScrollIndicator={false}>
-            <View style={styles.albumArtWrap}>
-              {currentTrack?.cover ? (
-                <Image
-                  source={{ uri: `${HF_BASE_URL}/${currentTrack.cover}` }}
-                  style={[
-                    styles.albumArtImage,
-                    { width: windowWidth - 96, height: windowWidth - 96 },
-                  ]}
-                />
-              ) : (
-                <View
-                  style={[
-                    styles.albumArt,
-                    { width: windowWidth - 96, height: windowWidth - 96 },
-                  ]}
-                >
-                  <Text style={styles.albumArtGlyph}>♪</Text>
-                </View>
-              )}
-            </View>
-
-            <View style={styles.fullTrackInfo}>
-              <Text style={styles.fullTrackTitle} numberOfLines={1}>{currentTrack?.title}</Text>
-              <Text style={styles.fullTrackArtist} numberOfLines={1}>{currentTrack?.artist || 'Unknown artist'}</Text>
-            </View>
-
-            <TouchableOpacity activeOpacity={1} style={styles.seekBarTouchable} onPress={handleSeekBarPress}>
-              <View style={styles.seekTrack}>
-                <View style={[styles.seekFill, { width: `${progressPct * 100}%` }]} />
-                <View style={[styles.seekThumb, { left: `${progressPct * 100}%` }]} />
-              </View>
-            </TouchableOpacity>
-            <View style={styles.timeRow}>
-              <Text style={styles.timeText}>{formatTime(displayTime)}</Text>
-              <Text style={styles.timeText}>{formatTime(duration)}</Text>
-            </View>
-
-            <View style={styles.controlsRow}>
-              <TouchableOpacity onPress={playPrev} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
-                <Ionicons name="play-skip-back" size={32} color={COLORS.white} />
+          <SafeAreaView style={[styles.fullPlayer, { backgroundColor: 'transparent' }]}>
+            <View style={styles.fullPlayerHeader}>
+              <TouchableOpacity
+                onPress={() => setPlayerOpen(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                style={styles.chevronButton}
+              >
+                <Ionicons name="chevron-down" size={26} color={COLORS.white} />
               </TouchableOpacity>
-              <TouchableOpacity onPress={togglePlayPause} style={styles.playPauseCircle}>
-                <Ionicons
-                  name={isPlaying ? 'pause' : 'play'}
-                  size={32}
-                  color={COLORS.bg}
-                  style={{ marginLeft: isPlaying ? 0 : 3 }}
-                />
-              </TouchableOpacity>
-              <TouchableOpacity onPress={playNext} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
-                <Ionicons name="play-skip-forward" size={32} color={COLORS.white} />
-              </TouchableOpacity>
+              <Text style={styles.fullPlayerHeaderLabel} numberOfLines={1}>NOW PLAYING</Text>
+              <View style={{ width: 24 }} />
             </View>
 
-            {/* Spotify-style Lyrics Box */}
-            <TouchableOpacity
-              activeOpacity={0.9}
-              style={[styles.lyricsBoxCard, { backgroundColor: nowPlayingTheme.cardBg }]}
-              onPress={() => setLyricsModalOpen(true)}
-            >
-              <View style={styles.lyricsBoxHeader}>
-                <Text style={styles.lyricsBoxTitle}>Lyrics</Text>
-                <Ionicons name="expand-outline" size={18} color={COLORS.white} />
+            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 + insets.bottom }} showsVerticalScrollIndicator={false}>
+              <View style={styles.albumArtWrap}>
+                {currentTrack?.cover ? (
+                  <Image
+                    source={{ uri: `${HF_BASE_URL}/${currentTrack.cover}` }}
+                    style={[
+                      styles.albumArtImage,
+                      { width: windowWidth - 96, height: windowWidth - 96 },
+                    ]}
+                  />
+                ) : (
+                  <View
+                    style={[
+                      styles.albumArt,
+                      { width: windowWidth - 96, height: windowWidth - 96 },
+                    ]}
+                  >
+                    <Text style={styles.albumArtGlyph}>♪</Text>
+                  </View>
+                )}
               </View>
 
-              {lyrics.length > 0 ? (
-                <View style={styles.lyricsViewport}>
-                  <Animated.View style={{ transform: [{ translateY: scrollY }] }}>
-                    {lyrics.map((line, idx) => {
-                      const isCurrent = idx === currentLineIndex;
-                      return (
-                        <View key={idx} style={styles.lyricLineSlot}>
-                          <Text
-                            style={[
-                              styles.lyricLineText,
-                              isCurrent
-                                ? [styles.lyricLineActive, { color: nowPlayingTheme.highlight }]
-                                : styles.lyricLineInactive,
-                            ]}
-                          >
-                            {line.text || '♪'}
-                          </Text>
-                        </View>
-                      );
-                    })}
-                  </Animated.View>
+              <View style={styles.fullTrackInfo}>
+                <View style={styles.titleGenreRow}>
+                  <Text style={styles.fullTrackTitle} numberOfLines={1}>{currentTrack?.title}</Text>
+                  {currentTrack?.genre ? (
+                    <View style={styles.genreBadge}>
+                      <Text style={styles.genreBadgeText}>{currentTrack.genre}</Text>
+                    </View>
+                  ) : null}
                 </View>
-              ) : (
-                <View style={styles.noLyricsContainer}>
-                  <Text style={styles.noLyricsText}>
-                    {currentTrack?.lrc ? 'Loading lyrics…' : 'No lyrics available'}
-                  </Text>
+                <Text style={styles.fullTrackArtist} numberOfLines={1}>{currentTrack?.artist || 'Unknown artist'}</Text>
+              </View>
+
+              <TouchableOpacity activeOpacity={1} style={styles.seekBarTouchable} onPress={handleSeekBarPress}>
+                <View style={styles.seekTrack}>
+                  <View style={[styles.seekFill, { width: `${progressPct * 100}%` }]} />
+                  <View style={[styles.seekThumb, { left: `${progressPct * 100}%` }]} />
                 </View>
-              )}
-            </TouchableOpacity>
-          </ScrollView>
-        </SafeAreaView>
+              </TouchableOpacity>
+              <View style={styles.timeRow}>
+                <Text style={styles.timeText}>{formatTime(displayTime)}</Text>
+                <Text style={styles.timeText}>{formatTime(duration)}</Text>
+              </View>
+
+              <View style={styles.controlsRow}>
+                <TouchableOpacity onPress={playPrev} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
+                  <Ionicons name="play-skip-back" size={32} color={COLORS.white} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={togglePlayPause} style={styles.playPauseCircle}>
+                  <Ionicons
+                    name={isPlaying ? 'pause' : 'play'}
+                    size={32}
+                    color={COLORS.bg}
+                    style={{ marginLeft: isPlaying ? 0 : 3 }}
+                  />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={playNext} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
+                  <Ionicons name="play-skip-forward" size={32} color={COLORS.white} />
+                </TouchableOpacity>
+              </View>
+
+              {/* Lyrics Box */}
+              <TouchableOpacity
+                activeOpacity={0.9}
+                style={[styles.lyricsBoxCard, { backgroundColor: nowPlayingTheme.cardBg }]}
+                onPress={() => setLyricsModalOpen(true)}
+              >
+                <View style={styles.lyricsBoxHeader}>
+                  <Text style={styles.lyricsBoxTitle}>Lyrics</Text>
+                  <Ionicons name="expand-outline" size={18} color={COLORS.white} />
+                </View>
+
+                {lyrics.length > 0 ? (
+                  <View style={styles.lyricsViewport}>
+                    <Animated.View style={{ transform: [{ translateY: scrollY }] }}>
+                      {lyrics.map((line, idx) => {
+                        const isCurrent = idx === currentLineIndex;
+                        return (
+                          <View key={idx} style={styles.lyricLineSlot}>
+                            <Text
+                              style={[
+                                styles.lyricLineText,
+                                isCurrent
+                                  ? [styles.lyricLineActive, { color: nowPlayingTheme.highlight }]
+                                  : styles.lyricLineInactive,
+                              ]}
+                            >
+                              {line.text || '♪'}
+                            </Text>
+                          </View>
+                        );
+                      })}
+                    </Animated.View>
+                  </View>
+                ) : (
+                  <View style={styles.noLyricsContainer}>
+                    <Text style={styles.noLyricsText}>
+                      {currentTrack?.lrc ? 'Loading lyrics…' : 'No lyrics available'}
+                    </Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+            </ScrollView>
+          </SafeAreaView>
         </LinearGradient>
 
-        {/* Expanded Lyrics Modal (Free Manual Scrolling) */}
+        {/* Expanded Lyrics Modal */}
         <Modal
           visible={lyricsModalOpen}
           animationType="slide"
@@ -630,37 +786,37 @@ function AppContent() {
           onRequestClose={() => setLyricsModalOpen(false)}
         >
           <LinearGradient colors={[nowPlayingTheme.top, nowPlayingTheme.bottom]} style={{ flex: 1 }}>
-          <SafeAreaView style={[styles.expandedLyricsContainer, { backgroundColor: 'transparent' }]}>
-            <View style={styles.expandedHeader}>
-              <Text style={styles.expandedTitle}>{currentTrack?.title}</Text>
-              <TouchableOpacity onPress={() => setLyricsModalOpen(false)}>
-                <Ionicons name="close-circle" size={28} color={COLORS.white} />
-              </TouchableOpacity>
-            </View>
+            <SafeAreaView style={[styles.expandedLyricsContainer, { backgroundColor: 'transparent' }]}>
+              <View style={styles.expandedHeader}>
+                <Text style={styles.expandedTitle}>{currentTrack?.title}</Text>
+                <TouchableOpacity onPress={() => setLyricsModalOpen(false)}>
+                  <Ionicons name="close-circle" size={28} color={COLORS.white} />
+                </TouchableOpacity>
+              </View>
 
-            <ScrollView
-              style={{ flex: 1 }}
-              contentContainerStyle={{ paddingVertical: 40, paddingHorizontal: 24 }}
-              showsVerticalScrollIndicator={true}
-            >
-              {lyrics.map((line, idx) => {
-                const isCurrent = idx === currentLineIndex;
-                return (
-                  <Text
-                    key={idx}
-                    style={[
-                      styles.expandedLyricLine,
-                      isCurrent
-                        ? [styles.expandedLyricActive, { color: nowPlayingTheme.highlight }]
-                        : styles.expandedLyricInactive,
-                    ]}
-                  >
-                    {line.text || '♪'}
-                  </Text>
-                );
-              })}
-            </ScrollView>
-          </SafeAreaView>
+              <ScrollView
+                style={{ flex: 1 }}
+                contentContainerStyle={{ paddingVertical: 40, paddingHorizontal: 24 }}
+                showsVerticalScrollIndicator={true}
+              >
+                {lyrics.map((line, idx) => {
+                  const isCurrent = idx === currentLineIndex;
+                  return (
+                    <Text
+                      key={idx}
+                      style={[
+                        styles.expandedLyricLine,
+                        isCurrent
+                          ? [styles.expandedLyricActive, { color: nowPlayingTheme.highlight }]
+                          : styles.expandedLyricInactive,
+                      ]}
+                    >
+                      {line.text || '♪'}
+                    </Text>
+                  );
+                })}
+              </ScrollView>
+            </SafeAreaView>
           </LinearGradient>
         </Modal>
       </Modal>
@@ -704,57 +860,6 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-// ---------------------------------------------------------------------
-// Smart "up next" matching
-// ---------------------------------------------------------------------
-
-// Cheap Levenshtein distance, used as a fuzzy fallback when two genre
-// strings share no whole words (e.g. "Synthwave" vs "Synth Pop").
-function levenshtein(a, b) {
-  const m = a.length;
-  const n = b.length;
-  if (m === 0) return n;
-  if (n === 0) return m;
-  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i][j] =
-        a[i - 1] === b[j - 1]
-          ? dp[i - 1][j - 1]
-          : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
-    }
-  }
-  return dp[m][n];
-}
-
-// Scores how close two genre labels are, from 0 (unrelated) to 1 (identical).
-// Works generically off whatever genre strings happen to be in playlist.json
-// — exact match scores highest, shared words ("Dream Pop" vs "Synth Pop")
-// score well, and otherwise it falls back to string-similarity so things
-// like "Alternative" and "Alt Rock" still land closer than total strangers.
-function genreSimilarity(genreA, genreB) {
-  if (!genreA || !genreB) return 0;
-  const a = genreA.toLowerCase().trim();
-  const b = genreB.toLowerCase().trim();
-  if (a === b) return 1;
-
-  const wordsA = new Set(a.split(/[\s/,&-]+/).filter(Boolean));
-  const wordsB = new Set(b.split(/[\s/,&-]+/).filter(Boolean));
-  const shared = [...wordsA].filter((w) => wordsB.has(w)).length;
-  const unionSize = new Set([...wordsA, ...wordsB]).size || 1;
-  const wordScore = shared / unionSize;
-
-  const dist = levenshtein(a, b);
-  const maxLen = Math.max(a.length, b.length) || 1;
-  const stringScore = 1 - dist / maxLen;
-
-  return wordScore * 0.7 + stringScore * 0.3;
-}
-
-// Picks the index of the best "up next" track: closest genre match to the
-// currently playing track, while excluding anything heard within the last
-// NO_REPEAT_WINDOW songs (recentIds, most-recently-played last).
 function pickSmartNextIndex(tracks, currentTrack, recentIds) {
   if (!tracks.length) return -1;
   if (tracks.length === 1) return 0;
@@ -766,9 +871,6 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds) {
     .map((t, idx) => ({ t, idx }))
     .filter(({ t }) => !blocked.has(t.id));
 
-  // Small library / lots of recent plays: relax the no-repeat rule rather
-  // than getting stuck, but still never allow an immediate back-to-back
-  // repeat of the current song.
   if (pool.length === 0) {
     pool = tracks
       .map((t, idx) => ({ t, idx }))
@@ -776,27 +878,37 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds) {
   }
   if (pool.length === 0) return 0;
 
-  const scored = pool.map(({ t, idx }) => ({
-    idx,
-    // tiny jitter so ties (or a totally genre-less library) don't always
-    // resolve to the same track/order
-    score: genreSimilarity(currentTrack?.genre, t.genre) + Math.random() * 0.05,
-  }));
-  scored.sort((a, b) => b.score - a.score);
+  const curGenre = (currentTrack?.genre || '').toLowerCase().trim();
+  const curArtist = (currentTrack?.artist || '').toLowerCase().trim();
+  const jumpGenre = Math.random() < 0.10;
 
-  // Pick randomly among the closest-matching cluster so it doesn't feel
-  // robotic while still strongly favoring genre closeness.
+  const scored = pool.map(({ t, idx }) => {
+    const tGenre = (t.genre || '').toLowerCase().trim();
+    const tArtist = (t.artist || '').toLowerCase().trim();
+    const isSameGenre = curGenre && tGenre && curGenre === tGenre;
+    const isSameArtist = curArtist && tArtist && curArtist === tArtist;
+
+    let score = 0;
+    if (!jumpGenre && isSameGenre) {
+      score += 10.0;
+      if (isSameArtist) score += 5.0;
+    } else if (jumpGenre && !isSameGenre) {
+      score += 10.0;
+      if (isSameArtist) score += 3.0;
+    } else if (isSameArtist) {
+      score += 3.0;
+    }
+
+    score += Math.random() * 2.0;
+    return { idx, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
   const best = scored[0].score;
-  const topCluster = scored.filter((s) => best - s.score < 0.08);
+  const topCluster = scored.filter((s) => best - s.score < 2.0);
   const chosen = topCluster[Math.floor(Math.random() * topCluster.length)];
   return chosen.idx;
 }
-
-// ---------------------------------------------------------------------
-// Cover-art color theming (Spotify-style "now playing" background)
-// ---------------------------------------------------------------------
-
-const DEFAULT_ACCENT = '#535353';
 
 function hexToRgb(hex) {
   let h = (hex || '').replace('#', '');
@@ -814,33 +926,16 @@ function rgbToHex(r, g, b) {
   );
 }
 
-// Mixes a color toward black. factor: 0 = unchanged, 1 = pure black.
 function darkenColor(hex, factor) {
   const { r, g, b } = hexToRgb(hex);
   return rgbToHex(r * (1 - factor), g * (1 - factor), b * (1 - factor));
 }
 
-// Mixes a color toward white. factor: 0 = unchanged, 1 = pure white.
 function lightenColor(hex, factor) {
   const { r, g, b } = hexToRgb(hex);
   return rgbToHex(r + (255 - r) * factor, g + (255 - g) * factor, b + (255 - b) * factor);
 }
 
-// Pulls a representative color out of a cover image using a hidden WebView
-// running an HTML5 <canvas>. Takes a `data:` URI (already downloaded and
-// resized natively by expo-image-manipulator) rather than a remote URL —
-// canvases can always read pixels from a data URI with no CORS concerns,
-// which is what made the earlier remote-URL version unreliable.
-//
-// How it works: loads the image into an <img>, draws it onto a small
-// canvas, computes lightness/saturation per pixel, and buckets colors
-// together by proximity. It tries progressively looser "tiers" — vibrant
-// colors first, then moderately saturated, then anything not pure
-// black/white — stopping at the first tier that finds a match, so black,
-// near-black, and gray/muddy tones only get used if the cover genuinely
-// has no color in it at all. Within a tier, buckets are ranked by total
-// saturation (not just pixel count), so a smaller but more colorful
-// cluster beats a larger but duller one.
 function buildColorProbeHtml(dataUri) {
   const safeDataUri = JSON.stringify(dataUri);
   return `
@@ -890,15 +985,11 @@ function buildColorProbeHtml(dataUri) {
               pixels.push({ r: r, g: g, b: b, l: l, s: s });
             }
 
-            // Tiers run from "strict, colorful only" to "lenient" — the
-            // first tier that finds ANY qualifying pixels wins, so black,
-            // near-black, and gray/muddy tones only get used as an
-            // absolute last resort instead of by default.
             var BUCKET = 24;
             var tiers = [
-              { minL: 0.16, maxL: 0.90, minS: 0.28 }, // vibrant colors only
-              { minL: 0.12, maxL: 0.93, minS: 0.16 }, // relax saturation a bit
-              { minL: 0.08, maxL: 0.96, minS: 0.06 }, // relax further, still not pure black/white
+              { minL: 0.16, maxL: 0.90, minS: 0.28 },
+              { minL: 0.12, maxL: 0.93, minS: 0.16 },
+              { minL: 0.08, maxL: 0.96, minS: 0.06 },
             ];
 
             var hex = null;
@@ -913,8 +1004,6 @@ function buildColorProbeHtml(dataUri) {
                 if (!buckets[key]) buckets[key] = { r: 0, g: 0, b: 0, n: 0, weight: 0 };
                 var bkt = buckets[key];
                 bkt.r += px.r; bkt.g += px.g; bkt.b += px.b; bkt.n += 1;
-                // weight by saturation so a smaller-but-more-colorful
-                // cluster can beat a larger-but-duller one
                 bkt.weight += 0.4 + px.s;
               }
 
@@ -930,8 +1019,6 @@ function buildColorProbeHtml(dataUri) {
             }
 
             if (!hex) {
-              // truly monochrome cover (grayscale/black-and-white art) —
-              // fall back to the plain average rather than crashing
               hex = countAll > 0
                 ? '#' + toHex(rSumAll / countAll) + toHex(gSumAll / countAll) + toHex(bSumAll / countAll)
                 : '${DEFAULT_ACCENT}';
@@ -952,11 +1039,6 @@ function buildColorProbeHtml(dataUri) {
 </html>`;
 }
 
-const FONT_REGULAR = 'Poppins_400Regular';
-const FONT_MEDIUM = 'Poppins_500Medium';
-const FONT_SEMIBOLD = 'Poppins_600SemiBold';
-const FONT_BOLD = 'Poppins_700Bold';
-
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bg },
   hiddenColorProbe: {
@@ -968,36 +1050,138 @@ const styles = StyleSheet.create({
     opacity: 0,
   },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  loadingText: { color: COLORS.gray, marginTop: 12, fontFamily: FONT_MEDIUM, fontSize: 13 },
+  loadingText: { color: COLORS.gray, marginTop: 12, fontFamily: 'Poppins_500Medium', fontSize: 13 },
 
-  headerRow: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 12 },
-  headerTitle: { color: COLORS.white, fontFamily: FONT_BOLD, fontSize: 26 },
+  headerRow: { paddingHorizontal: PADDING_H, paddingTop: 14, paddingBottom: 10 },
+  headerTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 24, letterSpacing: -0.3 },
+
+  // YT Music 3x3 Speed Dial
+  speedDialContainer: { marginBottom: 12 },
+  speedDialScroll: { marginBottom: 4 },
+  speedDialPage: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    paddingHorizontal: PADDING_H,
+    justifyContent: 'space-between',
+  },
+  speedDialTile: {
+    width: TILE_WIDTH,
+    marginBottom: 16,
+  },
+  speedDialCoverWrapper: {
+    width: TILE_WIDTH,
+    height: TILE_WIDTH,
+    borderRadius: 10,
+    overflow: 'hidden',
+    backgroundColor: COLORS.card,
+    marginBottom: 8,
+  },
+  speedDialCoverActive: {
+    borderWidth: 2,
+    borderColor: COLORS.green,
+  },
+  speedDialCover: {
+    width: '100%',
+    height: '100%',
+  },
+  speedDialCoverFallback: {
+    width: '100%',
+    height: '100%',
+    backgroundColor: COLORS.surface,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  speedDialTitle: {
+    color: COLORS.white,
+    fontFamily: 'Poppins_500Medium',
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  speedDialSubtitle: {
+    color: COLORS.grayDim,
+    fontFamily: 'Poppins_400Regular',
+    fontSize: 11,
+    lineHeight: 14,
+    marginTop: 2,
+  },
+
+  // Genre Filters Bar
+  filterBar: { paddingHorizontal: PADDING_H, paddingVertical: 8, gap: 10 },
+  filterPill: {
+    backgroundColor: COLORS.card,
+    paddingHorizontal: 16,
+    paddingVertical: 7,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  filterPillActive: {
+    backgroundColor: COLORS.green,
+  },
+  filterPillText: {
+    color: COLORS.white,
+    fontFamily: 'Poppins_500Medium',
+    fontSize: 12,
+  },
+  filterPillTextActive: {
+    color: COLORS.bg,
+    fontFamily: 'Poppins_700Bold',
+  },
+
+  // Section Header
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: PADDING_H,
+    paddingTop: 12,
+    paddingBottom: 8,
+  },
+  sectionTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 18 },
+  songCountText: { color: COLORS.grayDim, fontFamily: 'Poppins_500Medium', fontSize: 12 },
 
   // Track List
   trackRow: {
+    height: ITEM_HEIGHT,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
+    paddingHorizontal: PADDING_H,
   },
   trackCoverImage: {
-    width: 56,
-    height: 56,
-    borderRadius: 8,
+    width: 50,
+    height: 50,
+    borderRadius: 6,
   },
   trackArt: {
-    width: 56,
-    height: 56,
-    borderRadius: 8,
+    width: 50,
+    height: 50,
+    borderRadius: 6,
     backgroundColor: COLORS.card,
     justifyContent: 'center',
     alignItems: 'center',
   },
   trackArtGlyph: { color: COLORS.grayDim, fontSize: 18 },
-  trackTitle: { color: COLORS.white, fontFamily: FONT_MEDIUM, fontSize: 15 },
+  trackTitle: { color: COLORS.white, fontFamily: 'Poppins_500Medium', fontSize: 14 },
   trackTitleActive: { color: COLORS.green },
-  trackSubtitle: { color: COLORS.grayDim, fontFamily: FONT_REGULAR, fontSize: 12, marginTop: 2 },
+  trackSubtitle: { color: COLORS.grayDim, fontFamily: 'Poppins_400Regular', fontSize: 11, marginTop: 2 },
   nowPlayingDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: COLORS.green },
+
+  // See More Button
+  seeMoreButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    marginHorizontal: PADDING_H,
+    marginTop: 8,
+    backgroundColor: COLORS.card,
+    borderRadius: 24,
+  },
+  seeMoreText: {
+    color: COLORS.white,
+    fontFamily: 'Poppins_600SemiBold',
+    fontSize: 13,
+  },
 
   // Mini Player
   miniPlayer: {
@@ -1030,8 +1214,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  miniTitle: { color: COLORS.white, fontFamily: FONT_MEDIUM, fontSize: 14 },
-  miniSubtitle: { color: COLORS.gray, fontFamily: FONT_REGULAR, fontSize: 11, marginTop: 1 },
+  miniTitle: { color: COLORS.white, fontFamily: 'Poppins_500Medium', fontSize: 14 },
+  miniSubtitle: { color: COLORS.gray, fontFamily: 'Poppins_400Regular', fontSize: 11, marginTop: 1 },
 
   // Full Player
   fullPlayer: { flex: 1, backgroundColor: COLORS.bg, paddingHorizontal: 24 },
@@ -1047,7 +1231,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  fullPlayerHeaderLabel: { color: COLORS.gray, fontFamily: FONT_SEMIBOLD, fontSize: 12, letterSpacing: 1 },
+  fullPlayerHeaderLabel: { color: COLORS.gray, fontFamily: 'Poppins_600SemiBold', fontSize: 12, letterSpacing: 1 },
 
   albumArtWrap: { alignItems: 'center', marginTop: 16 },
   albumArtImage: {
@@ -1066,8 +1250,27 @@ const styles = StyleSheet.create({
   albumArtGlyph: { color: COLORS.grayDim, fontSize: 64 },
 
   fullTrackInfo: { marginTop: 24 },
-  fullTrackTitle: { color: COLORS.white, fontFamily: FONT_BOLD, fontSize: 22 },
-  fullTrackArtist: { color: COLORS.gray, fontFamily: FONT_REGULAR, fontSize: 14, marginTop: 4 },
+  titleGenreRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  fullTrackTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 22, flex: 1 },
+  genreBadge: {
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 12,
+    marginLeft: 10,
+    alignSelf: 'center',
+  },
+  genreBadgeText: {
+    color: COLORS.white,
+    fontFamily: 'Poppins_500Medium',
+    fontSize: 11,
+    textTransform: 'capitalize',
+  },
+  fullTrackArtist: { color: COLORS.gray, fontFamily: 'Poppins_400Regular', fontSize: 14, marginTop: 4 },
 
   seekBarTouchable: { marginTop: 20, paddingVertical: 8 },
   seekTrack: {
@@ -1088,7 +1291,7 @@ const styles = StyleSheet.create({
     marginLeft: -7,
   },
   timeRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 },
-  timeText: { color: COLORS.grayDim, fontFamily: FONT_REGULAR, fontSize: 11 },
+  timeText: { color: COLORS.grayDim, fontFamily: 'Poppins_400Regular', fontSize: 11 },
 
   controlsRow: {
     flexDirection: 'row',
@@ -1121,7 +1324,7 @@ const styles = StyleSheet.create({
   },
   lyricsBoxTitle: {
     color: COLORS.white,
-    fontFamily: FONT_BOLD,
+    fontFamily: 'Poppins_700Bold',
     fontSize: 14,
   },
   lyricsViewport: {
@@ -1134,7 +1337,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   lyricLineText: {
-    fontFamily: FONT_BOLD,
+    fontFamily: 'Poppins_700Bold',
     fontSize: 24,
     lineHeight: 32,
   },
@@ -1152,7 +1355,7 @@ const styles = StyleSheet.create({
   },
   noLyricsText: {
     color: COLORS.grayDim,
-    fontFamily: FONT_REGULAR,
+    fontFamily: 'Poppins_400Regular',
     fontStyle: 'italic',
     fontSize: 13,
   },
@@ -1173,11 +1376,11 @@ const styles = StyleSheet.create({
   },
   expandedTitle: {
     color: COLORS.white,
-    fontFamily: FONT_BOLD,
+    fontFamily: 'Poppins_700Bold',
     fontSize: 18,
   },
   expandedLyricLine: {
-    fontFamily: FONT_BOLD,
+    fontFamily: 'Poppins_700Bold',
     fontSize: 26,
     lineHeight: 38,
     marginVertical: 10,
