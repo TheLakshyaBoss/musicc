@@ -860,17 +860,31 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-function pickSmartNextIndex(tracks, currentTrack, recentIds) {
-  if (!tracks.length) return -1;
+// Helper: Euclidean distance between two 4D feature vectors [bpm, rms, centroid, pulse]
+function getVectorDistance(vecA, vecB) {
+  if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length !== vecB.length) {
+    return 0.5; // neutral fallback distance if one track lacks vectors
+  }
+  let sum = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    sum += Math.pow(vecA[i] - vecB[i], 2);
+  }
+  return Math.sqrt(sum);
+}
+
+function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
+  if (!tracks || !tracks.length) return -1;
   if (tracks.length === 1) return 0;
 
-  const blocked = new Set(recentIds.slice(-NO_REPEAT_WINDOW));
-  if (currentTrack) blocked.add(currentTrack.id);
+  const windowSize = typeof NO_REPEAT_WINDOW !== 'undefined' ? NO_REPEAT_WINDOW : 10;
+  const blocked = new Set(recentIds.slice(-windowSize));
+  if (currentTrack?.id) blocked.add(currentTrack.id);
 
   let pool = tracks
     .map((t, idx) => ({ t, idx }))
     .filter(({ t }) => !blocked.has(t.id));
 
+  // If repeat window blocked everything, just exclude the current song
   if (pool.length === 0) {
     pool = tracks
       .map((t, idx) => ({ t, idx }))
@@ -880,6 +894,9 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds) {
 
   const curGenre = (currentTrack?.genre || '').toLowerCase().trim();
   const curArtist = (currentTrack?.artist || '').toLowerCase().trim();
+  const curVector = currentTrack?.audio_vector;
+
+  // 10% chance to venture into a fresh genre while keeping similar acoustic energy
   const jumpGenre = Math.random() < 0.10;
 
   const scored = pool.map(({ t, idx }) => {
@@ -889,24 +906,43 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds) {
     const isSameArtist = curArtist && tArtist && curArtist === tArtist;
 
     let score = 0;
-    if (!jumpGenre && isSameGenre) {
-      score += 10.0;
-      if (isSameArtist) score += 5.0;
-    } else if (jumpGenre && !isSameGenre) {
-      score += 10.0;
-      if (isSameArtist) score += 3.0;
-    } else if (isSameArtist) {
-      score += 3.0;
+
+    // 1. Acoustic similarity score (0.0 - 10.0 pts)
+    // Distance ranges roughly ~0.0 (identical) to ~1.4 (opposite).
+    // Closer tracks get higher affinity points.
+    if (curVector && t.audio_vector) {
+      const dist = getVectorDistance(curVector, t.audio_vector);
+      score += Math.max(0, (1.2 - dist) * 8.0);
+    } else {
+      score += 4.0; // neutral baseline if audio vector is missing
     }
 
-    score += Math.random() * 2.0;
+    // 2. Genre coherence
+    if (!jumpGenre && isSameGenre) {
+      score += 8.0;
+    } else if (jumpGenre && !isSameGenre) {
+      score += 6.0;
+    }
+
+    // 3. Artist familiarity bonus
+    if (isSameArtist) {
+      score += 3.5;
+    }
+
+    // 4. Subtle jitter (0.0 - 1.5) to avoid robotic loops
+    score += Math.random() * 1.5;
+
     return { idx, score };
   });
 
+  // Sort descending by highest score
   scored.sort((a, b) => b.score - a.score);
-  const best = scored[0].score;
-  const topCluster = scored.filter((s) => best - s.score < 2.0);
+
+  // Pick randomly among top cluster within 1.8 points of best match
+  const bestScore = scored[0].score;
+  const topCluster = scored.filter((s) => bestScore - s.score < 1.8);
   const chosen = topCluster[Math.floor(Math.random() * topCluster.length)];
+
   return chosen.idx;
 }
 
