@@ -14,6 +14,8 @@ import {
   Modal,
   Animated,
   Easing,
+  TextInput,
+  Platform,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAudioPlayer, useAudioPlayerStatus, setAudioModeAsync } from 'expo-audio';
@@ -32,32 +34,62 @@ import {
 const HF_BASE_URL = 'https://huggingface.co/datasets/lakshya1234/my-audio-app/resolve/main';
 
 const COLORS = {
-  bg: '#000000',
-  surface: '#121212',
-  card: '#181818',
-  cardActive: '#282828',
+  bg: '#0A0A0C',
+  surface: '#121215',
+  card: '#18181D',
+  cardActive: '#222228',
   green: '#1DB954',
   greenPress: '#1ED760',
   white: '#FFFFFF',
-  gray: '#B3B3B3',
-  grayDim: '#727272',
-  border: '#2A2A2A',
+  gray: '#B8B8C0',
+  grayDim: '#6D6D78',
+  border: '#23232A',
+  borderSubtle: '#1C1C22',
 };
 
 const { width: SCREEN_W } = Dimensions.get('window');
-const ITEM_HEIGHT = 68;
+const ITEM_HEIGHT = 72;
 const LYRIC_BOX_HEIGHT = 220;
 const LINE_HEIGHT_SLOT = 70;
 const NO_REPEAT_WINDOW = 5;
 const RECENT_HISTORY_LIMIT = 12;
-const INITIAL_VISIBLE_COUNT = 10;
+const INITIAL_VISIBLE_COUNT = 12;
 const FILTER_GENRES = ['all', 'aura', 'love', 'sad', 'happy'];
-const DEFAULT_ACCENT = '#535353';
+const DEFAULT_ACCENT = '#3A3A42';
 
-// Polished spacing for 3x3 Speed Dial layout
-const TILE_GAP = 14;
+// 3x3 Speed Dial layout calculations
+const TILE_GAP = 12;
 const PADDING_H = 18;
 const TILE_WIDTH = (SCREEN_W - PADDING_H * 2 - TILE_GAP * 2) / 3;
+
+// Smart Fuzzy Match helper
+function smartFuzzyMatch(targetStr, searchStr) {
+  if (!searchStr) return true;
+  if (!targetStr) return false;
+
+  const target = targetStr.toLowerCase();
+  const search = searchStr.toLowerCase().trim();
+
+  if (target.includes(search)) return true;
+
+  const searchWords = search.split(/\s+/).filter(Boolean);
+  const allWordsMatched = searchWords.every((w) => target.includes(w));
+  if (allWordsMatched) return true;
+
+  const cleanTarget = target.replace(/[^a-z0-9]/g, '');
+  const cleanSearch = search.replace(/[^a-z0-9]/g, '');
+  if (cleanTarget.includes(cleanSearch)) return true;
+
+  let tIdx = 0;
+  let sIdx = 0;
+  while (tIdx < cleanTarget.length && sIdx < cleanSearch.length) {
+    if (cleanTarget[tIdx] === cleanSearch[sIdx]) {
+      sIdx++;
+    }
+    tIdx++;
+  }
+  return sIdx === cleanSearch.length;
+}
 
 export default function App() {
   return (
@@ -70,21 +102,24 @@ export default function App() {
 const TrackRowItem = memo(({ item, isSelected, isPlaying, onSelect }) => {
   return (
     <TouchableOpacity
-      activeOpacity={0.6}
-      style={styles.trackRow}
+      activeOpacity={0.65}
+      style={[styles.trackRow, isSelected && styles.trackRowSelected]}
       onPress={() => onSelect(item.id)}
     >
-      {item.cover ? (
-        <Image
-          source={{ uri: `${HF_BASE_URL}/${item.cover}` }}
-          style={styles.trackCoverImage}
-        />
-      ) : (
-        <View style={styles.trackArt}>
-          <Text style={styles.trackArtGlyph}>♪</Text>
-        </View>
-      )}
-      <View style={{ flex: 1, marginLeft: 12 }}>
+      <View style={styles.trackCoverContainer}>
+        {item.cover ? (
+          <Image
+            source={{ uri: `${HF_BASE_URL}/${item.cover}` }}
+            style={styles.trackCoverImage}
+          />
+        ) : (
+          <View style={styles.trackArt}>
+            <Text style={styles.trackArtGlyph}>♪</Text>
+          </View>
+        )}
+      </View>
+
+      <View style={styles.trackDetails}>
         <Text numberOfLines={1} style={[styles.trackTitle, isSelected && styles.trackTitleActive]}>
           {item.title}
         </Text>
@@ -92,7 +127,16 @@ const TrackRowItem = memo(({ item, isSelected, isPlaying, onSelect }) => {
           {(item.artist || 'Unknown artist') + (item.genre ? ` • ${item.genre}` : '')}
         </Text>
       </View>
-      {isSelected && isPlaying && <View style={styles.nowPlayingDot} />}
+
+      {isSelected && (
+        <View style={styles.indicatorWrap}>
+          {isPlaying ? (
+            <View style={styles.nowPlayingDotPulse} />
+          ) : (
+            <View style={[styles.nowPlayingDotPulse, { backgroundColor: COLORS.grayDim }]} />
+          )}
+        </View>
+      )}
     </TouchableOpacity>
   );
 });
@@ -164,7 +208,10 @@ function AppContent() {
   const [randomizedTracks, setRandomizedTracks] = useState([]);
   const [speedDialTracks, setSpeedDialTracks] = useState([]);
   const [selectedGenre, setSelectedGenre] = useState('all');
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  
+  // No track selected on initial startup
+  const [currentIndex, setCurrentIndex] = useState(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [lyrics, setLyrics] = useState([]);
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
@@ -184,7 +231,8 @@ function AppContent() {
   const recentIdsRef = useRef([]);
   const backStackRef = useRef([]);
 
-  const currentTrack = rawTracks[currentIndex] || null;
+  const currentTrack = currentIndex !== null && rawTracks[currentIndex] ? rawTracks[currentIndex] : null;
+
   const audioSource = useMemo(() => {
     if (!currentTrack?.file) return '';
     return `${HF_BASE_URL}/${currentTrack.file}`;
@@ -227,7 +275,7 @@ function AppContent() {
   }, []);
 
   useEffect(() => {
-    if (!rawTracks.length) return;
+    if (currentIndex === null || !rawTracks.length) return;
     const nextIdx = (currentIndex + 1) % rawTracks.length;
     const nextTrack = rawTracks[nextIdx];
     if (nextTrack?.cover) {
@@ -344,21 +392,20 @@ function AppContent() {
 
   useEffect(() => {
     advancedRef.current = false;
-    shouldAutoplayRef.current = true;
   }, [currentTrack?.id]);
 
   useEffect(() => {
-    if (!player || !status || !shouldAutoplayRef.current) return;
+    if (!player || !status || !shouldAutoplayRef.current || !currentTrack) return;
     if (status.isLoaded && !status.isPlaying) {
       try {
         player.play();
         shouldAutoplayRef.current = false;
       } catch (err) {}
     }
-  }, [player, status?.isLoaded, status?.isPlaying]);
+  }, [player, status?.isLoaded, status?.isPlaying, currentTrack]);
 
   useEffect(() => {
-    if (!status || advancedRef.current || !duration) return;
+    if (!status || advancedRef.current || !duration || currentIndex === null) return;
     const finished =
       status.didJustFinish === true ||
       (smoothTime >= duration - 0.3 && status.isPlaying === false && smoothTime > 1);
@@ -366,10 +413,10 @@ function AppContent() {
       advancedRef.current = true;
       playNext();
     }
-  }, [status?.didJustFinish, status?.isPlaying, smoothTime, duration]);
+  }, [status?.didJustFinish, status?.isPlaying, smoothTime, duration, currentIndex]);
 
   const togglePlayPause = useCallback(() => {
-    if (!player) return;
+    if (!player || currentIndex === null) return;
     try {
       if (player.playing || status?.isPlaying) {
         player.pause();
@@ -379,22 +426,24 @@ function AppContent() {
     } catch (err) {
       console.warn('Play/pause action failed:', err);
     }
-  }, [player, status?.isPlaying]);
+  }, [player, status?.isPlaying, currentIndex]);
 
   const playNext = useCallback(() => {
-    if (!rawTracks.length) return;
+    if (!rawTracks.length || currentIndex === null) return;
     const current = rawTracks[currentIndex];
     if (current) {
       recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
       backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
     }
     const nextIdx = pickSmartNextIndex(rawTracks, current, recentIdsRef.current);
+    shouldAutoplayRef.current = true;
     setCurrentIndex(nextIdx >= 0 ? nextIdx : (currentIndex + 1) % rawTracks.length);
   }, [rawTracks, currentIndex]);
 
   const playPrev = useCallback(() => {
-    if (!rawTracks.length) return;
+    if (!rawTracks.length || currentIndex === null) return;
     const prevIdx = backStackRef.current.length ? backStackRef.current.pop() : undefined;
+    shouldAutoplayRef.current = true;
     if (prevIdx !== undefined && prevIdx !== currentIndex) {
       setCurrentIndex(prevIdx);
     } else {
@@ -406,11 +455,12 @@ function AppContent() {
     setRawTracks((currentRaw) => {
       const targetIdx = currentRaw.findIndex((t) => t.id === trackId);
       if (targetIdx !== -1) {
-        const current = currentRaw[currentIndex];
-        if (current) {
+        if (currentIndex !== null && currentRaw[currentIndex]) {
+          const current = currentRaw[currentIndex];
           recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
           backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
         }
+        shouldAutoplayRef.current = true;
         setCurrentIndex(targetIdx);
         setPlayerOpen(true);
       }
@@ -425,8 +475,8 @@ function AppContent() {
 
   const nowPlayingTheme = useMemo(() => {
     const top = darkenColor(dominantColor, 0.45);
-    const bottom = darkenColor(dominantColor, 0.88);
-    const cardBg = darkenColor(dominantColor, 0.72);
+    const bottom = darkenColor(dominantColor, 0.90);
+    const cardBg = darkenColor(dominantColor, 0.74);
     const highlight = lightenColor(dominantColor, 0.55);
     return { top, bottom, cardBg, highlight };
   }, [dominantColor]);
@@ -441,16 +491,30 @@ function AppContent() {
   }, [speedDialTracks]);
 
   const filteredTracks = useMemo(() => {
-    if (selectedGenre === 'all') return randomizedTracks;
-    return randomizedTracks.filter(
-      (t) => (t.genre || '').toLowerCase().trim() === selectedGenre.toLowerCase().trim()
-    );
-  }, [randomizedTracks, selectedGenre]);
+    let pool = randomizedTracks;
+    
+    if (selectedGenre !== 'all') {
+      pool = pool.filter(
+        (t) => (t.genre || '').toLowerCase().trim() === selectedGenre.toLowerCase().trim()
+      );
+    }
+
+    const query = searchQuery.trim();
+    if (query) {
+      pool = pool.filter((t) => {
+        const titleMatch = smartFuzzyMatch(t.title, query);
+        const artistMatch = smartFuzzyMatch(t.artist, query);
+        return titleMatch || artistMatch;
+      });
+    }
+
+    return pool;
+  }, [randomizedTracks, selectedGenre, searchQuery]);
 
   const displayedTracks = useMemo(() => {
-    if (isExpanded) return filteredTracks;
+    if (searchQuery.trim().length > 0 || isExpanded) return filteredTracks;
     return filteredTracks.slice(0, INITIAL_VISIBLE_COUNT);
-  }, [filteredTracks, isExpanded]);
+  }, [filteredTracks, isExpanded, searchQuery]);
 
   const handleFilterPress = useCallback((genre) => {
     if (genre === 'all') {
@@ -481,15 +545,41 @@ function AppContent() {
     }
   }, [player, status?.isLoaded, currentTrack?.id]);
 
+  // Headset / Earphone Double Tap and Single Tap Hardware Media Listeners
   useEffect(() => {
     if (!player || typeof player.addListener !== 'function') return;
+
+    // Right Earphone Double Tap (Next Track)
     const nextSub = player.addListener('onRemoteNextTrack', () => playNext());
+    const skipNextSub = player.addListener('onRemoteSkipToNext', () => playNext());
+
+    // Left Earphone Double Tap (Previous Track)
     const prevSub = player.addListener('onRemotePreviousTrack', () => playPrev());
+    const skipPrevSub = player.addListener('onRemoteSkipToPrevious', () => playPrev());
+
+    // Single Tap from either side (Play / Pause toggle)
+    const playSub = player.addListener('onRemotePlay', () => {
+      try {
+        player.play();
+      } catch (e) {}
+    });
+    const pauseSub = player.addListener('onRemotePause', () => {
+      try {
+        player.pause();
+      } catch (e) {}
+    });
+    const toggleSub = player.addListener('onRemoteTogglePlayPause', () => togglePlayPause());
+
     return () => {
       nextSub?.remove?.();
+      skipNextSub?.remove?.();
       prevSub?.remove?.();
+      skipPrevSub?.remove?.();
+      playSub?.remove?.();
+      pauseSub?.remove?.();
+      toggleSub?.remove?.();
     };
-  }, [player, playNext, playPrev]);
+  }, [player, playNext, playPrev, togglePlayPause]);
 
   const handleSeekBarPress = (evt) => {
     if (!duration || !player) return;
@@ -549,15 +639,38 @@ function AppContent() {
           );
         })}
       </ScrollView>
+
+      {/* Smart Real-time Search Box */}
+      <View style={styles.searchContainer}>
+        <Ionicons name="search-outline" size={17} color={COLORS.grayDim} style={styles.searchIcon} />
+        <TextInput
+          placeholder="Search songs, artists..."
+          placeholderTextColor={COLORS.grayDim}
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          style={styles.searchInput}
+          autoCorrect={false}
+          autoCapitalize="none"
+          returnKeyType="search"
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity onPress={() => setSearchQuery('')} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+            <Ionicons name="close-circle" size={18} color={COLORS.grayDim} />
+          </TouchableOpacity>
+        )}
+      </View>
+
       <View style={styles.sectionHeaderRow}>
         <Text style={styles.sectionTitle}>Songs</Text>
-        <Text style={styles.songCountText}>{filteredTracks.length} Total</Text>
+        <Text style={styles.songCountText}>
+          {filteredTracks.length} {searchQuery.trim().length > 0 ? 'Found' : 'Tracks'}
+        </Text>
       </View>
     </View>
-  ), [speedDialPages, currentTrack?.id, selectTrackById, selectedGenre, handleFilterPress, filteredTracks.length]);
+  ), [speedDialPages, currentTrack?.id, selectTrackById, selectedGenre, handleFilterPress, filteredTracks.length, searchQuery]);
 
   const listFooter = useMemo(() => {
-    if (filteredTracks.length <= INITIAL_VISIBLE_COUNT) return null;
+    if (searchQuery.trim().length > 0 || filteredTracks.length <= INITIAL_VISIBLE_COUNT) return null;
     return (
       <TouchableOpacity
         activeOpacity={0.7}
@@ -575,13 +688,13 @@ function AppContent() {
         />
       </TouchableOpacity>
     );
-  }, [filteredTracks.length, isExpanded]);
+  }, [filteredTracks.length, isExpanded, searchQuery]);
 
   if (!fontsLoaded || loading) {
     return (
       <View style={[styles.center, { backgroundColor: COLORS.bg }]}>
         <ActivityIndicator size="large" color={COLORS.green} />
-        <Text style={styles.loadingText}>Loading your music…</Text>
+        <Text style={styles.loadingText}>Loading library…</Text>
       </View>
     );
   }
@@ -615,14 +728,15 @@ function AppContent() {
         maxToRenderPerBatch={10}
         windowSize={5}
         removeClippedSubviews={true}
-        contentContainerStyle={{ paddingBottom: (currentTrack ? 96 : 20) + insets.bottom }}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={{ paddingBottom: (currentTrack ? 104 : 24) + insets.bottom }}
       />
 
-      {/* Mini Player */}
+      {/* Modern Floating Mini Player */}
       {currentTrack && (
         <TouchableOpacity
-          activeOpacity={0.9}
-          style={[styles.miniPlayer, { bottom: 8 + insets.bottom }]}
+          activeOpacity={0.94}
+          style={[styles.miniPlayer, { bottom: 12 + insets.bottom }]}
           onPress={() => setPlayerOpen(true)}
         >
           <View style={styles.miniProgressTrack}>
@@ -639,14 +753,18 @@ function AppContent() {
                 <Text style={styles.trackArtGlyph}>♪</Text>
               </View>
             )}
-            <View style={{ flex: 1, marginLeft: 10 }}>
+            <View style={{ flex: 1, marginLeft: 12, justifyContent: 'center' }}>
               <Text numberOfLines={1} style={styles.miniTitle}>{currentTrack.title}</Text>
               <Text numberOfLines={1} style={styles.miniSubtitle}>
                 {(currentTrack.artist || 'Unknown artist') + (currentTrack.genre ? ` • ${currentTrack.genre}` : '')}
               </Text>
             </View>
-            <TouchableOpacity onPress={togglePlayPause} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-              <Ionicons name={isPlaying ? 'pause' : 'play'} size={24} color={COLORS.white} />
+            <TouchableOpacity 
+              onPress={togglePlayPause} 
+              hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
+              style={styles.miniPlayBtn}
+            >
+              <Ionicons name={isPlaying ? 'pause' : 'play'} size={22} color={COLORS.white} />
             </TouchableOpacity>
           </View>
         </TouchableOpacity>
@@ -665,10 +783,10 @@ function AppContent() {
                 hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
                 style={styles.chevronButton}
               >
-                <Ionicons name="chevron-down" size={26} color={COLORS.white} />
+                <Ionicons name="chevron-down" size={24} color={COLORS.white} />
               </TouchableOpacity>
-              <Text style={styles.fullPlayerHeaderLabel} numberOfLines={1}>NOW PLAYING</Text>
-              <View style={{ width: 24 }} />
+              <Text style={styles.fullPlayerHeaderLabel} numberOfLines={1}>PLAYING FROM LIBRARY</Text>
+              <View style={{ width: 32 }} />
             </View>
 
             <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 + insets.bottom }} showsVerticalScrollIndicator={false}>
@@ -678,14 +796,14 @@ function AppContent() {
                     source={{ uri: `${HF_BASE_URL}/${currentTrack.cover}` }}
                     style={[
                       styles.albumArtImage,
-                      { width: windowWidth - 96, height: windowWidth - 96 },
+                      { width: windowWidth - 84, height: windowWidth - 84 },
                     ]}
                   />
                 ) : (
                   <View
                     style={[
                       styles.albumArt,
-                      { width: windowWidth - 96, height: windowWidth - 96 },
+                      { width: windowWidth - 84, height: windowWidth - 84 },
                     ]}
                   >
                     <Text style={styles.albumArtGlyph}>♪</Text>
@@ -718,18 +836,18 @@ function AppContent() {
 
               <View style={styles.controlsRow}>
                 <TouchableOpacity onPress={playPrev} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
-                  <Ionicons name="play-skip-back" size={32} color={COLORS.white} />
+                  <Ionicons name="play-skip-back" size={30} color={COLORS.white} />
                 </TouchableOpacity>
-                <TouchableOpacity onPress={togglePlayPause} style={styles.playPauseCircle}>
+                <TouchableOpacity onPress={togglePlayPause} style={styles.playPauseCircle} activeOpacity={0.85}>
                   <Ionicons
                     name={isPlaying ? 'pause' : 'play'}
-                    size={32}
+                    size={30}
                     color={COLORS.bg}
                     style={{ marginLeft: isPlaying ? 0 : 3 }}
                   />
                 </TouchableOpacity>
                 <TouchableOpacity onPress={playNext} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
-                  <Ionicons name="play-skip-forward" size={32} color={COLORS.white} />
+                  <Ionicons name="play-skip-forward" size={30} color={COLORS.white} />
                 </TouchableOpacity>
               </View>
 
@@ -769,7 +887,7 @@ function AppContent() {
                 ) : (
                   <View style={styles.noLyricsContainer}>
                     <Text style={styles.noLyricsText}>
-                      {currentTrack?.lrc ? 'Loading lyrics…' : 'No lyrics available'}
+                      {currentTrack?.lrc ? 'Loading synchronized lyrics…' : 'No lyrics available'}
                     </Text>
                   </View>
                 )}
@@ -788,9 +906,9 @@ function AppContent() {
           <LinearGradient colors={[nowPlayingTheme.top, nowPlayingTheme.bottom]} style={{ flex: 1 }}>
             <SafeAreaView style={[styles.expandedLyricsContainer, { backgroundColor: 'transparent' }]}>
               <View style={styles.expandedHeader}>
-                <Text style={styles.expandedTitle}>{currentTrack?.title}</Text>
-                <TouchableOpacity onPress={() => setLyricsModalOpen(false)}>
-                  <Ionicons name="close-circle" size={28} color={COLORS.white} />
+                <Text style={styles.expandedTitle} numberOfLines={1}>{currentTrack?.title}</Text>
+                <TouchableOpacity onPress={() => setLyricsModalOpen(false)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+                  <Ionicons name="close" size={26} color={COLORS.white} />
                 </TouchableOpacity>
               </View>
 
@@ -860,10 +978,9 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-// Helper: Euclidean distance between two 4D feature vectors [bpm, rms, centroid, pulse]
 function getVectorDistance(vecA, vecB) {
   if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length !== vecB.length) {
-    return 0.5; // neutral fallback distance if one track lacks vectors
+    return 0.5;
   }
   let sum = 0;
   for (let i = 0; i < vecA.length; i++) {
@@ -884,7 +1001,6 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
     .map((t, idx) => ({ t, idx }))
     .filter(({ t }) => !blocked.has(t.id));
 
-  // If repeat window blocked everything, just exclude the current song
   if (pool.length === 0) {
     pool = tracks
       .map((t, idx) => ({ t, idx }))
@@ -896,7 +1012,6 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
   const curArtist = (currentTrack?.artist || '').toLowerCase().trim();
   const curVector = currentTrack?.audio_vector;
 
-  // 10% chance to venture into a fresh genre while keeping similar acoustic energy
   const jumpGenre = Math.random() < 0.10;
 
   const scored = pool.map(({ t, idx }) => {
@@ -907,38 +1022,30 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
 
     let score = 0;
 
-    // 1. Acoustic similarity score (0.0 - 10.0 pts)
-    // Distance ranges roughly ~0.0 (identical) to ~1.4 (opposite).
-    // Closer tracks get higher affinity points.
     if (curVector && t.audio_vector) {
       const dist = getVectorDistance(curVector, t.audio_vector);
       score += Math.max(0, (1.2 - dist) * 8.0);
     } else {
-      score += 4.0; // neutral baseline if audio vector is missing
+      score += 4.0;
     }
 
-    // 2. Genre coherence
     if (!jumpGenre && isSameGenre) {
       score += 8.0;
     } else if (jumpGenre && !isSameGenre) {
       score += 6.0;
     }
 
-    // 3. Artist familiarity bonus
     if (isSameArtist) {
       score += 3.5;
     }
 
-    // 4. Subtle jitter (0.0 - 1.5) to avoid robotic loops
     score += Math.random() * 1.5;
 
     return { idx, score };
   });
 
-  // Sort descending by highest score
   scored.sort((a, b) => b.score - a.score);
 
-  // Pick randomly among top cluster within 1.8 points of best match
   const bestScore = scored[0].score;
   const topCluster = scored.filter((s) => bestScore - s.score < 1.8);
   const chosen = topCluster[Math.floor(Math.random() * topCluster.length)];
@@ -1086,13 +1193,13 @@ const styles = StyleSheet.create({
     opacity: 0,
   },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  loadingText: { color: COLORS.gray, marginTop: 12, fontFamily: 'Poppins_500Medium', fontSize: 13 },
+  loadingText: { color: COLORS.gray, marginTop: 12, fontFamily: 'Poppins_500Medium', fontSize: 13, letterSpacing: 0.2 },
 
-  headerRow: { paddingHorizontal: PADDING_H, paddingTop: 14, paddingBottom: 10 },
-  headerTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 24, letterSpacing: -0.3 },
+  headerRow: { paddingHorizontal: PADDING_H, paddingTop: 16, paddingBottom: 12 },
+  headerTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 24, letterSpacing: -0.4 },
 
-  // YT Music 3x3 Speed Dial
-  speedDialContainer: { marginBottom: 12 },
+  // Speed Dial
+  speedDialContainer: { marginBottom: 14 },
   speedDialScroll: { marginBottom: 4 },
   speedDialPage: {
     flexDirection: 'row',
@@ -1110,7 +1217,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     overflow: 'hidden',
     backgroundColor: COLORS.card,
-    marginBottom: 8,
+    marginBottom: 7,
+    borderWidth: 1,
+    borderColor: COLORS.borderSubtle,
   },
   speedDialCoverActive: {
     borderWidth: 2,
@@ -1144,18 +1253,19 @@ const styles = StyleSheet.create({
   // Genre Filters Bar
   filterBar: { paddingHorizontal: PADDING_H, paddingVertical: 8, gap: 10 },
   filterPill: {
-    backgroundColor: COLORS.card,
+    backgroundColor: COLORS.surface,
     paddingHorizontal: 16,
     paddingVertical: 7,
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: 'transparent',
+    borderColor: COLORS.border,
   },
   filterPillActive: {
     backgroundColor: COLORS.green,
+    borderColor: COLORS.green,
   },
   filterPillText: {
-    color: COLORS.white,
+    color: COLORS.gray,
     fontFamily: 'Poppins_500Medium',
     fontSize: 12,
   },
@@ -1164,43 +1274,84 @@ const styles = StyleSheet.create({
     fontFamily: 'Poppins_700Bold',
   },
 
+  // Minimal Search Box
+  searchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.surface,
+    marginHorizontal: PADDING_H,
+    marginTop: 8,
+    marginBottom: 10,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    height: 44,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  searchIcon: {
+    marginRight: 9,
+  },
+  searchInput: {
+    flex: 1,
+    color: COLORS.white,
+    fontFamily: 'Poppins_400Regular',
+    fontSize: 13,
+    paddingVertical: 0,
+  },
+
   // Section Header
   sectionHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: PADDING_H,
-    paddingTop: 12,
+    paddingTop: 10,
     paddingBottom: 8,
   },
-  sectionTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 18 },
+  sectionTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 19, letterSpacing: -0.3 },
   songCountText: { color: COLORS.grayDim, fontFamily: 'Poppins_500Medium', fontSize: 12 },
 
-  // Track List
+  // Track List Item
   trackRow: {
     height: ITEM_HEIGHT,
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: PADDING_H,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.02)',
+  },
+  trackRowSelected: {
+    backgroundColor: 'rgba(29, 185, 84, 0.04)',
+  },
+  trackCoverContainer: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 3,
   },
   trackCoverImage: {
     width: 50,
     height: 50,
-    borderRadius: 6,
+    borderRadius: 8,
   },
   trackArt: {
     width: 50,
     height: 50,
-    borderRadius: 6,
+    borderRadius: 8,
     backgroundColor: COLORS.card,
     justifyContent: 'center',
     alignItems: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   trackArtGlyph: { color: COLORS.grayDim, fontSize: 18 },
-  trackTitle: { color: COLORS.white, fontFamily: 'Poppins_500Medium', fontSize: 14 },
+  trackDetails: { flex: 1, marginLeft: 14 },
+  trackTitle: { color: COLORS.white, fontFamily: 'Poppins_500Medium', fontSize: 14.5 },
   trackTitleActive: { color: COLORS.green },
-  trackSubtitle: { color: COLORS.grayDim, fontFamily: 'Poppins_400Regular', fontSize: 11, marginTop: 2 },
-  nowPlayingDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: COLORS.green },
+  trackSubtitle: { color: COLORS.grayDim, fontFamily: 'Poppins_400Regular', fontSize: 11.5, marginTop: 2 },
+  indicatorWrap: { marginLeft: 10 },
+  nowPlayingDotPulse: { width: 8, height: 8, borderRadius: 4, backgroundColor: COLORS.green },
 
   // See More Button
   seeMoreButton: {
@@ -1209,9 +1360,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingVertical: 14,
     marginHorizontal: PADDING_H,
-    marginTop: 8,
-    backgroundColor: COLORS.card,
-    borderRadius: 24,
+    marginTop: 12,
+    backgroundColor: COLORS.surface,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   seeMoreText: {
     color: COLORS.white,
@@ -1219,39 +1372,49 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
 
-  // Mini Player
+  // Floating Mini Player
   miniPlayer: {
     position: 'absolute',
-    left: 8,
-    right: 8,
-    bottom: 8,
-    backgroundColor: COLORS.cardActive,
-    borderRadius: 8,
+    left: 12,
+    right: 12,
+    backgroundColor: '#1E1E24',
+    borderRadius: 14,
     overflow: 'hidden',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.45,
+    shadowRadius: 10,
+    elevation: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
   },
-  miniProgressTrack: { height: 2, backgroundColor: '#3E3E3E', width: '100%' },
+  miniProgressTrack: { height: 2, backgroundColor: 'rgba(255, 255, 255, 0.1)', width: '100%' },
   miniProgressFill: { height: 2, backgroundColor: COLORS.green },
   miniPlayerContent: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   miniCoverImage: {
-    width: 40,
-    height: 40,
-    borderRadius: 4,
+    width: 42,
+    height: 42,
+    borderRadius: 7,
   },
   trackArtSmall: {
-    width: 40,
-    height: 40,
-    borderRadius: 4,
+    width: 42,
+    height: 42,
+    borderRadius: 7,
     backgroundColor: COLORS.card,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  miniTitle: { color: COLORS.white, fontFamily: 'Poppins_500Medium', fontSize: 14 },
+  miniTitle: { color: COLORS.white, fontFamily: 'Poppins_500Medium', fontSize: 13.5 },
   miniSubtitle: { color: COLORS.gray, fontFamily: 'Poppins_400Regular', fontSize: 11, marginTop: 1 },
+  miniPlayBtn: {
+    padding: 6,
+    borderRadius: 20,
+  },
 
   // Full Player
   fullPlayer: { flex: 1, backgroundColor: COLORS.bg, paddingHorizontal: 24 },
@@ -1267,38 +1430,49 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  fullPlayerHeaderLabel: { color: COLORS.gray, fontFamily: 'Poppins_600SemiBold', fontSize: 12, letterSpacing: 1 },
+  fullPlayerHeaderLabel: { 
+    color: COLORS.gray, 
+    fontFamily: 'Poppins_600SemiBold', 
+    fontSize: 11, 
+    letterSpacing: 1.2 
+  },
 
-  albumArtWrap: { alignItems: 'center', marginTop: 16 },
+  albumArtWrap: { 
+    alignItems: 'center', 
+    marginTop: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.45,
+    shadowRadius: 18,
+    elevation: 12,
+  },
   albumArtImage: {
-    width: SCREEN_W - 96,
-    height: SCREEN_W - 96,
-    borderRadius: 12,
+    borderRadius: 16,
   },
   albumArt: {
-    width: SCREEN_W - 96,
-    height: SCREEN_W - 96,
-    borderRadius: 12,
+    borderRadius: 16,
     backgroundColor: COLORS.card,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  albumArtGlyph: { color: COLORS.grayDim, fontSize: 64 },
+  albumArtGlyph: { color: COLORS.grayDim, fontSize: 68 },
 
-  fullTrackInfo: { marginTop: 24 },
+  fullTrackInfo: { marginTop: 28 },
   titleGenreRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  fullTrackTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 22, flex: 1 },
+  fullTrackTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 23, flex: 1, letterSpacing: -0.3 },
   genreBadge: {
-    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
     paddingHorizontal: 10,
     paddingVertical: 3,
     borderRadius: 12,
     marginLeft: 10,
     alignSelf: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
   },
   genreBadgeText: {
     color: COLORS.white,
@@ -1306,12 +1480,12 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textTransform: 'capitalize',
   },
-  fullTrackArtist: { color: COLORS.gray, fontFamily: 'Poppins_400Regular', fontSize: 14, marginTop: 4 },
+  fullTrackArtist: { color: COLORS.gray, fontFamily: 'Poppins_400Regular', fontSize: 14.5, marginTop: 4 },
 
-  seekBarTouchable: { marginTop: 20, paddingVertical: 8 },
+  seekBarTouchable: { marginTop: 22, paddingVertical: 8 },
   seekTrack: {
     height: 4,
-    backgroundColor: '#3E3E3E',
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
     borderRadius: 2,
     width: '100%',
     position: 'relative',
@@ -1326,31 +1500,37 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.white,
     marginLeft: -7,
   },
-  timeRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 },
-  timeText: { color: COLORS.grayDim, fontFamily: 'Poppins_400Regular', fontSize: 11 },
+  timeRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
+  timeText: { color: COLORS.grayDim, fontFamily: 'Poppins_400Regular', fontSize: 11.5 },
 
   controlsRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 20,
+    marginTop: 22,
     gap: 40,
   },
   playPauseCircle: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
+    width: 66,
+    height: 66,
+    borderRadius: 33,
     backgroundColor: COLORS.white,
     justifyContent: 'center',
     alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 6,
   },
 
-  // Compact Lyrics Box
+  // Lyrics Card
   lyricsBoxCard: {
-    marginTop: 28,
-    backgroundColor: COLORS.card,
-    borderRadius: 12,
-    padding: 16,
+    marginTop: 30,
+    borderRadius: 16,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.06)',
   },
   lyricsBoxHeader: {
     flexDirection: 'row',
@@ -1396,7 +1576,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
 
-  // Expanded Full Lyrics View
+  // Expanded Lyrics Modal
   expandedLyricsContainer: {
     flex: 1,
     backgroundColor: COLORS.bg,
@@ -1406,7 +1586,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 24,
-    paddingVertical: 16,
+    paddingVertical: 18,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
@@ -1414,6 +1594,8 @@ const styles = StyleSheet.create({
     color: COLORS.white,
     fontFamily: 'Poppins_700Bold',
     fontSize: 18,
+    flex: 1,
+    marginRight: 16,
   },
   expandedLyricLine: {
     fontFamily: 'Poppins_700Bold',
