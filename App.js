@@ -15,7 +15,6 @@ import {
   Animated,
   Easing,
   TextInput,
-  Platform,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAudioPlayer, useAudioPlayerStatus, setAudioModeAsync } from 'expo-audio';
@@ -51,18 +50,17 @@ const { width: SCREEN_W } = Dimensions.get('window');
 const ITEM_HEIGHT = 72;
 const LYRIC_BOX_HEIGHT = 220;
 const LINE_HEIGHT_SLOT = 70;
-const NO_REPEAT_WINDOW = 5;
-const RECENT_HISTORY_LIMIT = 12;
+const NO_REPEAT_WINDOW = 6;
+const RECENT_HISTORY_LIMIT = 15;
 const INITIAL_VISIBLE_COUNT = 12;
 const FILTER_GENRES = ['all', 'aura', 'love', 'sad', 'happy'];
 const DEFAULT_ACCENT = '#3A3A42';
 
-// 3x3 Speed Dial layout calculations
 const TILE_GAP = 12;
 const PADDING_H = 18;
 const TILE_WIDTH = (SCREEN_W - PADDING_H * 2 - TILE_GAP * 2) / 3;
 
-// Smart Fuzzy Match helper
+// --- High-Performance Smart Fuzzy Matching ---
 function smartFuzzyMatch(targetStr, searchStr) {
   if (!searchStr) return true;
   if (!targetStr) return false;
@@ -73,8 +71,7 @@ function smartFuzzyMatch(targetStr, searchStr) {
   if (target.includes(search)) return true;
 
   const searchWords = search.split(/\s+/).filter(Boolean);
-  const allWordsMatched = searchWords.every((w) => target.includes(w));
-  if (allWordsMatched) return true;
+  if (searchWords.length > 1 && searchWords.every((w) => target.includes(w))) return true;
 
   const cleanTarget = target.replace(/[^a-z0-9]/g, '');
   const cleanSearch = search.replace(/[^a-z0-9]/g, '');
@@ -83,12 +80,121 @@ function smartFuzzyMatch(targetStr, searchStr) {
   let tIdx = 0;
   let sIdx = 0;
   while (tIdx < cleanTarget.length && sIdx < cleanSearch.length) {
-    if (cleanTarget[tIdx] === cleanSearch[sIdx]) {
-      sIdx++;
-    }
+    if (cleanTarget[tIdx] === cleanSearch[sIdx]) sIdx++;
     tIdx++;
   }
   return sIdx === cleanSearch.length;
+}
+
+// --- Spotify-Style Acoustic Feature Distance Engine ---
+function computeAcousticDistance(vecA, vecB) {
+  if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length < 4 || vecB.length < 4) {
+    return 0.5;
+  }
+
+  // Feature indices: [0: BPM, 1: RMS/Energy, 2: Centroid/Brightness, 3: Pulse/Beat Clarity]
+  const bpmA = vecA[0];
+  const bpmB = vecB[0];
+  
+  // Harmonic tempo matching (checks 1x, 0.5x, 2x tempo alignment)
+  const diffStandard = Math.abs(bpmA - bpmB);
+  const diffHalf = Math.abs(bpmA - bpmB * 0.5);
+  const diffDouble = Math.abs(bpmA * 0.5 - bpmB);
+  const minBpmDiff = Math.min(diffStandard, diffHalf, diffDouble);
+
+  const rmsDiff = Math.abs(vecA[1] - vecB[1]);
+  const centroidDiff = Math.abs(vecA[2] - vecB[2]);
+  const pulseDiff = Math.abs(vecA[3] - vecB[3]);
+
+  // Perceptual weights: Energy & Tempo govern flow most strongly
+  const weightedDist = Math.sqrt(
+    Math.pow(minBpmDiff, 2) * 0.35 +
+    Math.pow(rmsDiff, 2) * 0.35 +
+    Math.pow(centroidDiff, 2) * 0.12 +
+    Math.pow(pulseDiff, 2) * 0.18
+  );
+
+  return weightedDist;
+}
+
+function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
+  if (!tracks || !tracks.length) return -1;
+  if (tracks.length === 1) return 0;
+
+  const windowSize = typeof NO_REPEAT_WINDOW !== 'undefined' ? NO_REPEAT_WINDOW : 6;
+  const blocked = new Set(recentIds.slice(-windowSize));
+  if (currentTrack?.id) blocked.add(currentTrack.id);
+
+  let pool = tracks
+    .map((t, idx) => ({ t, idx }))
+    .filter(({ t }) => !blocked.has(t.id));
+
+  if (pool.length === 0) {
+    pool = tracks
+      .map((t, idx) => ({ t, idx }))
+      .filter(({ t }) => t.id !== currentTrack?.id);
+  }
+  if (pool.length === 0) return 0;
+
+  const curGenre = (currentTrack?.genre || '').toLowerCase().trim();
+  const curArtist = (currentTrack?.artist || '').toLowerCase().trim();
+  const curVector = currentTrack?.audio_vector;
+
+  // Track recent artist count to prevent artist flooding
+  const recentArtistCount = recentIds.slice(-4).reduce((cnt, id) => {
+    const item = tracks.find((x) => x.id === id);
+    return item && item.artist?.toLowerCase().trim() === curArtist ? cnt + 1 : cnt;
+  }, 0);
+
+  // 12% probability of gentle genre exploratory jump
+  const jumpGenre = Math.random() < 0.12;
+
+  const scored = pool.map(({ t, idx }) => {
+    const tGenre = (t.genre || '').toLowerCase().trim();
+    const tArtist = (t.artist || '').toLowerCase().trim();
+    const isSameGenre = curGenre && tGenre && curGenre === tGenre;
+    const isSameArtist = curArtist && tArtist && curArtist === tArtist;
+
+    let score = 0;
+
+    // 1. Acoustic similarity (0.0 to 12.0)
+    if (curVector && t.audio_vector) {
+      const dist = computeAcousticDistance(curVector, t.audio_vector);
+      // dist is usually between 0.02 and 0.60
+      score += Math.max(0, (0.75 - dist) * 16.0);
+    } else {
+      score += 5.0;
+    }
+
+    // 2. Genre Continuity
+    if (!jumpGenre && isSameGenre) {
+      score += 7.0;
+    } else if (jumpGenre && !isSameGenre) {
+      score += 5.5;
+    }
+
+    // 3. Artist Affinity vs Overplay dampening
+    if (isSameArtist) {
+      if (recentArtistCount >= 1) {
+        score -= 2.0; // avoid 3 in a row by same artist
+      } else {
+        score += 2.8;
+      }
+    }
+
+    // 4. Subtle human-like jitter
+    score += Math.random() * 1.2;
+
+    return { idx, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+
+  // Take top 3 closest matches and pick using softmax-style weighting
+  const topCluster = scored.slice(0, Math.min(3, scored.length));
+  const chosen = topCluster[Math.floor(Math.random() * topCluster.length)];
+
+  return chosen.idx;
 }
 
 export default function App() {
@@ -209,8 +315,8 @@ function AppContent() {
   const [speedDialTracks, setSpeedDialTracks] = useState([]);
   const [selectedGenre, setSelectedGenre] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   
-  // No track selected on initial startup
   const [currentIndex, setCurrentIndex] = useState(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [lyrics, setLyrics] = useState([]);
@@ -240,6 +346,14 @@ function AppContent() {
 
   const player = useAudioPlayer(audioSource);
   const status = useAudioPlayerStatus(player);
+
+  // Debounce search query to keep typing responsive
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+    }, 120);
+    return () => clearTimeout(handler);
+  }, [searchQuery]);
 
   useEffect(() => {
     setAudioModeAsync({
@@ -335,16 +449,13 @@ function AppContent() {
       const payload = JSON.parse(event.nativeEvent.data);
       if (payload.ok && payload.color) {
         setDominantColor(payload.color);
-      } else if (payload.error) {
-        console.warn('Cover color probe failed, using fallback theme:', payload.error);
       }
-    } catch (err) {
-      console.warn('Cover color probe message parse failed:', err);
-    }
+    } catch (err) {}
   }, []);
 
   const colorProbeHtml = colorProbeDataUri ? buildColorProbeHtml(colorProbeDataUri) : null;
 
+  // Ultra-smooth audio time sync without thread contention
   useEffect(() => {
     if (fastTimer.current) clearInterval(fastTimer.current);
 
@@ -354,7 +465,7 @@ function AppContent() {
         const t = player.currentTime ?? status?.currentTime ?? 0;
         setSmoothTime(t);
       } catch (err) {}
-    }, 100);
+    }, 250);
 
     return () => clearInterval(fastTimer.current);
   }, [player, seeking, status?.currentTime]);
@@ -379,8 +490,8 @@ function AppContent() {
 
         Animated.timing(scrollY, {
           toValue: targetTranslateY,
-          duration: 300,
-          easing: Easing.out(Easing.quad),
+          duration: 250,
+          easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
         }).start();
       }
@@ -424,7 +535,7 @@ function AppContent() {
         player.play();
       }
     } catch (err) {
-      console.warn('Play/pause action failed:', err);
+      console.warn('Play/pause failed:', err);
     }
   }, [player, status?.isPlaying, currentIndex]);
 
@@ -499,7 +610,7 @@ function AppContent() {
       );
     }
 
-    const query = searchQuery.trim();
+    const query = debouncedSearch.trim();
     if (query) {
       pool = pool.filter((t) => {
         const titleMatch = smartFuzzyMatch(t.title, query);
@@ -509,12 +620,12 @@ function AppContent() {
     }
 
     return pool;
-  }, [randomizedTracks, selectedGenre, searchQuery]);
+  }, [randomizedTracks, selectedGenre, debouncedSearch]);
 
   const displayedTracks = useMemo(() => {
-    if (searchQuery.trim().length > 0 || isExpanded) return filteredTracks;
+    if (debouncedSearch.trim().length > 0 || isExpanded) return filteredTracks;
     return filteredTracks.slice(0, INITIAL_VISIBLE_COUNT);
-  }, [filteredTracks, isExpanded, searchQuery]);
+  }, [filteredTracks, isExpanded, debouncedSearch]);
 
   const handleFilterPress = useCallback((genre) => {
     if (genre === 'all') {
@@ -540,33 +651,23 @@ function AppContent() {
           showPreviousTrack: true,
         }
       );
-    } catch (err) {
-      console.warn('setActiveForLockScreen failed:', err);
-    }
+    } catch (err) {}
   }, [player, status?.isLoaded, currentTrack?.id]);
 
-  // Headset / Earphone Double Tap and Single Tap Hardware Media Listeners
+  // Headset & Remote Control Gestures
   useEffect(() => {
     if (!player || typeof player.addListener !== 'function') return;
 
-    // Right Earphone Double Tap (Next Track)
     const nextSub = player.addListener('onRemoteNextTrack', () => playNext());
     const skipNextSub = player.addListener('onRemoteSkipToNext', () => playNext());
-
-    // Left Earphone Double Tap (Previous Track)
     const prevSub = player.addListener('onRemotePreviousTrack', () => playPrev());
     const skipPrevSub = player.addListener('onRemoteSkipToPrevious', () => playPrev());
 
-    // Single Tap from either side (Play / Pause toggle)
     const playSub = player.addListener('onRemotePlay', () => {
-      try {
-        player.play();
-      } catch (e) {}
+      try { player.play(); } catch (e) {}
     });
     const pauseSub = player.addListener('onRemotePause', () => {
-      try {
-        player.pause();
-      } catch (e) {}
+      try { player.pause(); } catch (e) {}
     });
     const toggleSub = player.addListener('onRemoteTogglePlayPause', () => togglePlayPause());
 
@@ -593,7 +694,7 @@ function AppContent() {
       player.seekTo(newTime);
       setSmoothTime(newTime);
     } catch (err) {}
-    setTimeout(() => setSeeking(false), 150);
+    setTimeout(() => setSeeking(false), 120);
   };
 
   const getItemLayout = useCallback((_, index) => ({
@@ -640,7 +741,7 @@ function AppContent() {
         })}
       </ScrollView>
 
-      {/* Smart Real-time Search Box */}
+      {/* Real-time Fuzzy Search Box */}
       <View style={styles.searchContainer}>
         <Ionicons name="search-outline" size={17} color={COLORS.grayDim} style={styles.searchIcon} />
         <TextInput
@@ -663,14 +764,14 @@ function AppContent() {
       <View style={styles.sectionHeaderRow}>
         <Text style={styles.sectionTitle}>Songs</Text>
         <Text style={styles.songCountText}>
-          {filteredTracks.length} {searchQuery.trim().length > 0 ? 'Found' : 'Tracks'}
+          {filteredTracks.length} {debouncedSearch.trim().length > 0 ? 'Found' : 'Tracks'}
         </Text>
       </View>
     </View>
-  ), [speedDialPages, currentTrack?.id, selectTrackById, selectedGenre, handleFilterPress, filteredTracks.length, searchQuery]);
+  ), [speedDialPages, currentTrack?.id, selectTrackById, selectedGenre, handleFilterPress, filteredTracks.length, searchQuery, debouncedSearch]);
 
   const listFooter = useMemo(() => {
-    if (searchQuery.trim().length > 0 || filteredTracks.length <= INITIAL_VISIBLE_COUNT) return null;
+    if (debouncedSearch.trim().length > 0 || filteredTracks.length <= INITIAL_VISIBLE_COUNT) return null;
     return (
       <TouchableOpacity
         activeOpacity={0.7}
@@ -688,7 +789,7 @@ function AppContent() {
         />
       </TouchableOpacity>
     );
-  }, [filteredTracks.length, isExpanded, searchQuery]);
+  }, [filteredTracks.length, isExpanded, debouncedSearch]);
 
   if (!fontsLoaded || loading) {
     return (
@@ -724,15 +825,16 @@ function AppContent() {
         getItemLayout={getItemLayout}
         ListHeaderComponent={listHeader}
         ListFooterComponent={listFooter}
-        initialNumToRender={12}
-        maxToRenderPerBatch={10}
+        initialNumToRender={10}
+        maxToRenderPerBatch={8}
         windowSize={5}
+        updateCellsBatchingPeriod={50}
         removeClippedSubviews={true}
         keyboardShouldPersistTaps="handled"
         contentContainerStyle={{ paddingBottom: (currentTrack ? 104 : 24) + insets.bottom }}
       />
 
-      {/* Modern Floating Mini Player */}
+      {/* Floating Modern Mini Player */}
       {currentTrack && (
         <TouchableOpacity
           activeOpacity={0.94}
@@ -896,7 +998,7 @@ function AppContent() {
           </SafeAreaView>
         </LinearGradient>
 
-        {/* Expanded Lyrics Modal */}
+        {/* Full Expanded Lyrics Modal */}
         <Modal
           visible={lyricsModalOpen}
           animationType="slide"
@@ -978,81 +1080,6 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-function getVectorDistance(vecA, vecB) {
-  if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length !== vecB.length) {
-    return 0.5;
-  }
-  let sum = 0;
-  for (let i = 0; i < vecA.length; i++) {
-    sum += Math.pow(vecA[i] - vecB[i], 2);
-  }
-  return Math.sqrt(sum);
-}
-
-function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
-  if (!tracks || !tracks.length) return -1;
-  if (tracks.length === 1) return 0;
-
-  const windowSize = typeof NO_REPEAT_WINDOW !== 'undefined' ? NO_REPEAT_WINDOW : 10;
-  const blocked = new Set(recentIds.slice(-windowSize));
-  if (currentTrack?.id) blocked.add(currentTrack.id);
-
-  let pool = tracks
-    .map((t, idx) => ({ t, idx }))
-    .filter(({ t }) => !blocked.has(t.id));
-
-  if (pool.length === 0) {
-    pool = tracks
-      .map((t, idx) => ({ t, idx }))
-      .filter(({ t }) => t.id !== currentTrack?.id);
-  }
-  if (pool.length === 0) return 0;
-
-  const curGenre = (currentTrack?.genre || '').toLowerCase().trim();
-  const curArtist = (currentTrack?.artist || '').toLowerCase().trim();
-  const curVector = currentTrack?.audio_vector;
-
-  const jumpGenre = Math.random() < 0.10;
-
-  const scored = pool.map(({ t, idx }) => {
-    const tGenre = (t.genre || '').toLowerCase().trim();
-    const tArtist = (t.artist || '').toLowerCase().trim();
-    const isSameGenre = curGenre && tGenre && curGenre === tGenre;
-    const isSameArtist = curArtist && tArtist && curArtist === tArtist;
-
-    let score = 0;
-
-    if (curVector && t.audio_vector) {
-      const dist = getVectorDistance(curVector, t.audio_vector);
-      score += Math.max(0, (1.2 - dist) * 8.0);
-    } else {
-      score += 4.0;
-    }
-
-    if (!jumpGenre && isSameGenre) {
-      score += 8.0;
-    } else if (jumpGenre && !isSameGenre) {
-      score += 6.0;
-    }
-
-    if (isSameArtist) {
-      score += 3.5;
-    }
-
-    score += Math.random() * 1.5;
-
-    return { idx, score };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const bestScore = scored[0].score;
-  const topCluster = scored.filter((s) => bestScore - s.score < 1.8);
-  const chosen = topCluster[Math.floor(Math.random() * topCluster.length)];
-
-  return chosen.idx;
-}
-
 function hexToRgb(hex) {
   let h = (hex || '').replace('#', '');
   if (h.length === 3) h = h.split('').map((c) => c + c).join('');
@@ -1112,7 +1139,6 @@ function buildColorProbeHtml(dataUri) {
             ctx.drawImage(img, 0, 0, size, size);
             var data = ctx.getImageData(0, 0, size, size).data;
 
-            var w = canvas.width, h = canvas.height;
             var pixels = [];
             var rSumAll = 0, gSumAll = 0, bSumAll = 0, countAll = 0;
 
@@ -1250,7 +1276,7 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 
-  // Genre Filters Bar
+  // Filter Bar
   filterBar: { paddingHorizontal: PADDING_H, paddingVertical: 8, gap: 10 },
   filterPill: {
     backgroundColor: COLORS.surface,
@@ -1576,7 +1602,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
 
-  // Expanded Lyrics Modal
+  // Full Expanded Lyrics Modal
   expandedLyricsContainer: {
     flex: 1,
     backgroundColor: COLORS.bg,
