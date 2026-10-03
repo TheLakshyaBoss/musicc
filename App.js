@@ -339,10 +339,10 @@ function AppContent() {
 
   // Transition & Loop Guards
   const isTransitioningRef = useRef(false);
-  const shouldAutoplayRef = useRef(false);
+  const activeTrackLoadedRef = useRef(false);
+  
   const currentIndexRef = useRef(currentIndex);
   const rawTracksRef = useRef(rawTracks);
-  const activeTrackLoadedRef = useRef(false);
 
   useEffect(() => {
     currentIndexRef.current = currentIndex;
@@ -354,12 +354,8 @@ function AppContent() {
 
   const currentTrack = currentIndex !== null && rawTracks[currentIndex] ? rawTracks[currentIndex] : null;
 
-  const audioSource = useMemo(() => {
-    if (!currentTrack?.file) return '';
-    return `${HF_BASE_URL}/${currentTrack.file}`;
-  }, [currentTrack?.file]);
-
-  const player = useAudioPlayer(audioSource);
+  // We explicitly bypass hook-based auto-reloading to prevent background freezing
+  const player = useAudioPlayer(null);
   const status = useAudioPlayerStatus(player);
 
   useEffect(() => {
@@ -402,15 +398,7 @@ function AppContent() {
       });
   }, []);
 
-  useEffect(() => {
-    if (currentIndex === null || !rawTracks.length) return;
-    const nextIdx = (currentIndex + 1) % rawTracks.length;
-    const nextTrack = rawTracks[nextIdx];
-    if (nextTrack?.cover) {
-      Image.prefetch(`${HF_BASE_URL}/${nextTrack.cover}`).catch(() => {});
-    }
-  }, [currentIndex, rawTracks]);
-
+  // Sync lyrics when current track changes
   useEffect(() => {
     setCurrentLineIndex(-1);
     setSmoothTime(0);
@@ -475,7 +463,7 @@ function AppContent() {
       try {
         const t = player.currentTime ?? status?.currentTime ?? 0;
         setSmoothTime(t);
-        // Mark as actively progressing once past first 0.5s of audio
+        // Mark active only once the track has reliably started playing
         if (t > 0.5) {
           activeTrackLoadedRef.current = true;
           isTransitioningRef.current = false;
@@ -514,37 +502,53 @@ function AppContent() {
     }
   }, [smoothTime, lyrics]);
 
-  // Guaranteed autoplay execution whenever source updates
-  useEffect(() => {
-    if (!player || !currentTrack || !shouldAutoplayRef.current) return;
+  // =========================================================================
+  // CORE BACKGROUND PLAYBACK ENGINE - Synchronous Imperative Execution
+  // =========================================================================
+  const playTrackIndex = useCallback((idx) => {
+    const list = rawTracksRef.current;
+    const track = list[idx];
+    if (!track || !player) return;
 
-    let mounted = true;
-    const tryPlay = () => {
-      if (!mounted) return;
-      try {
-        player.play();
-        shouldAutoplayRef.current = false;
-      } catch (e) {}
-    };
+    // Lock transition to prevent loops
+    isTransitioningRef.current = true;
+    activeTrackLoadedRef.current = false;
+    setCurrentIndex(idx);
 
-    if (status?.isLoaded) {
-      tryPlay();
-    } else {
-      const timer = setTimeout(tryPlay, 100);
-      return () => {
-        mounted = false;
-        clearTimeout(timer);
-      };
-    }
-  }, [player, status?.isLoaded, currentTrack]);
+    const targetUrl = `${HF_BASE_URL}/${track.file}`;
+
+    // SYNCHRONOUS COMMANDS: This ensures Android/iOS background services 
+    // never sleep the JS thread because we instruct the native module instantly.
+    try {
+      player.replace(targetUrl);
+      player.play();
+    } catch (e) {}
+
+    try {
+      player.setActiveForLockScreen(
+        true,
+        {
+          title: track.title,
+          artist: track.artist || 'Unknown artist',
+          artworkUrl: track.cover ? `${HF_BASE_URL}/${track.cover}` : undefined,
+        },
+        {
+          showSeekForward: true,
+          showSeekBackward: true,
+        }
+      );
+    } catch (e) {}
+
+    // Failsafe unlock in case buffering takes longer than 1.5s
+    setTimeout(() => {
+      isTransitioningRef.current = false;
+    }, 1500);
+  }, [player]);
 
   const playNext = useCallback(() => {
     const list = rawTracksRef.current;
     const curIdx = currentIndexRef.current;
     if (!list.length || curIdx === null || isTransitioningRef.current) return;
-
-    isTransitioningRef.current = true;
-    activeTrackLoadedRef.current = false;
 
     const current = list[curIdx];
     if (current) {
@@ -553,34 +557,21 @@ function AppContent() {
     }
 
     const nextIdx = pickSmartNextIndex(list, current, recentIdsRef.current);
-    shouldAutoplayRef.current = true;
-    setCurrentIndex(nextIdx >= 0 ? nextIdx : (curIdx + 1) % list.length);
-
-    setTimeout(() => {
-      isTransitioningRef.current = false;
-    }, 400); // Shorter lock timeout for snappier manual skips
-  }, []);
+    playTrackIndex(nextIdx >= 0 ? nextIdx : (curIdx + 1) % list.length);
+  }, [playTrackIndex]);
 
   const playPrev = useCallback(() => {
     const list = rawTracksRef.current;
     const curIdx = currentIndexRef.current;
     if (!list.length || curIdx === null || isTransitioningRef.current) return;
 
-    isTransitioningRef.current = true;
-    activeTrackLoadedRef.current = false;
-
     const prevIdx = backStackRef.current.length ? backStackRef.current.pop() : undefined;
-    shouldAutoplayRef.current = true;
     if (prevIdx !== undefined && prevIdx !== curIdx) {
-      setCurrentIndex(prevIdx);
+      playTrackIndex(prevIdx);
     } else {
-      setCurrentIndex((curIdx - 1 + list.length) % list.length);
+      playTrackIndex((curIdx - 1 + list.length) % list.length);
     }
-
-    setTimeout(() => {
-      isTransitioningRef.current = false;
-    }, 400);
-  }, []);
+  }, [playTrackIndex]);
 
   const togglePlayPause = useCallback(() => {
     if (!player || currentIndexRef.current === null) return;
@@ -593,6 +584,7 @@ function AppContent() {
     } catch (err) {}
   }, [player, status?.isPlaying]);
 
+  // Keep fresh references for native listeners
   const playNextRef = useRef(playNext);
   const playPrevRef = useRef(playPrev);
   const togglePlayPauseRef = useRef(togglePlayPause);
@@ -606,8 +598,8 @@ function AppContent() {
   // Native Background Event Listener for Track End
   useEffect(() => {
     if (!player || typeof player.addListener !== 'function') return;
-
     const subs = [];
+
     const handlePlaybackState = (s) => {
       if (!s || isTransitioningRef.current || !activeTrackLoadedRef.current) return;
 
@@ -654,23 +646,55 @@ function AppContent() {
           recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
           backStackRef.current = [...backStackRef.current, currentIndexRef.current].slice(-50);
         }
-        isTransitioningRef.current = false;
-        activeTrackLoadedRef.current = false;
-        shouldAutoplayRef.current = true;
-        setCurrentIndex(targetIdx);
+        playTrackIndex(targetIdx);
         setPlayerOpen(true);
       }
       return currentRaw;
     });
-  }, []);
+  }, [playTrackIndex]);
+
+  // Bluetooth earphone controls
+  useEffect(() => {
+    if (!player || typeof player.addListener !== 'function') return;
+
+    const subscriptions = [];
+    const addSafe = (eventName, callback) => {
+      try {
+        const sub = player.addListener(eventName, callback);
+        if (sub) subscriptions.push(sub);
+      } catch (e) {}
+    };
+
+    addSafe('onRemoteNextTrack', () => playNextRef.current());
+    addSafe('onRemoteSkipToNext', () => playNextRef.current());
+    addSafe('seekForward', () => playNextRef.current());
+
+    addSafe('onRemotePreviousTrack', () => playPrevRef.current());
+    addSafe('onRemoteSkipToPrevious', () => playPrevRef.current());
+    addSafe('seekBackward', () => playPrevRef.current());
+
+    addSafe('onRemotePlay', () => {
+      try { player.play(); } catch (e) {}
+    });
+    addSafe('onRemotePause', () => {
+      try { player.pause(); } catch (e) {}
+    });
+    addSafe('onRemoteTogglePlayPause', () => togglePlayPauseRef.current());
+
+    return () => {
+      subscriptions.forEach((sub) => {
+        try { sub?.remove?.(); } catch (e) {}
+      });
+    };
+  }, [player]);
 
   const duration = status?.duration || 0;
   const displayTime = seeking ? seekValue : smoothTime;
   const progressPct = duration > 0 ? Math.min(displayTime / duration, 1) : 0;
   const isPlaying = status?.isPlaying ?? player?.playing ?? false;
   
-  // Buffering indicator state to prevent UI feeling laggy
-  const isBuffering = !status?.isLoaded || status?.isBuffering;
+  // Buffering state to show UI spinner instead of freezing
+  const isBuffering = currentIndex !== null && (!status?.isLoaded || status?.isBuffering);
 
   const nowPlayingTheme = useMemo(() => {
     const top = darkenColor(dominantColor, 0.45);
@@ -724,60 +748,6 @@ function AppContent() {
     }
   }, [rawTracks]);
 
-  // Lockscreen controls & persistent background notification
-  useEffect(() => {
-    if (!player || !status?.isLoaded || !currentTrack) return;
-    try {
-      player.setActiveForLockScreen(
-        true,
-        {
-          title: currentTrack.title,
-          artist: currentTrack.artist || 'Unknown artist',
-          artworkUrl: currentTrack.cover ? `${HF_BASE_URL}/${currentTrack.cover}` : undefined,
-        },
-        {
-          showSeekForward: true,
-          showSeekBackward: true,
-        }
-      ).catch(() => {});
-    } catch (err) {}
-  }, [player, status?.isLoaded, currentTrack?.id]);
-
-  // Bluetooth earphone controls
-  useEffect(() => {
-    if (!player || typeof player.addListener !== 'function') return;
-
-    const subscriptions = [];
-    const addSafe = (eventName, callback) => {
-      try {
-        const sub = player.addListener(eventName, callback);
-        if (sub) subscriptions.push(sub);
-      } catch (e) {}
-    };
-
-    addSafe('onRemoteNextTrack', () => playNextRef.current());
-    addSafe('onRemoteSkipToNext', () => playNextRef.current());
-    addSafe('seekForward', () => playNextRef.current());
-
-    addSafe('onRemotePreviousTrack', () => playPrevRef.current());
-    addSafe('onRemoteSkipToPrevious', () => playPrevRef.current());
-    addSafe('seekBackward', () => playPrevRef.current());
-
-    addSafe('onRemotePlay', () => {
-      try { player.play(); } catch (e) {}
-    });
-    addSafe('onRemotePause', () => {
-      try { player.pause(); } catch (e) {}
-    });
-    addSafe('onRemoteTogglePlayPause', () => togglePlayPauseRef.current());
-
-    return () => {
-      subscriptions.forEach((sub) => {
-        try { sub?.remove?.(); } catch (e) {}
-      });
-    };
-  }, [player]);
-
   const handleSeekBarPress = (evt) => {
     if (!duration || !player) return;
     const x = evt.nativeEvent.locationX;
@@ -805,7 +775,7 @@ function AppContent() {
       <TrackRowItem
         item={item}
         isSelected={isSel}
-        isPlaying={isSel ? isPlaying : false} // Prevents thousands of re-renders per second
+        isPlaying={isSel ? isPlaying : false} 
         onSelect={selectTrackById}
       />
     );
