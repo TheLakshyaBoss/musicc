@@ -92,11 +92,9 @@ function computeAcousticDistance(vecA, vecB) {
     return 0.5;
   }
 
-  // Feature indices: [0: BPM, 1: RMS/Energy, 2: Centroid/Brightness, 3: Pulse/Beat Clarity]
   const bpmA = vecA[0];
   const bpmB = vecB[0];
   
-  // Harmonic tempo matching (checks 1x, 0.5x, 2x tempo alignment)
   const diffStandard = Math.abs(bpmA - bpmB);
   const diffHalf = Math.abs(bpmA - bpmB * 0.5);
   const diffDouble = Math.abs(bpmA * 0.5 - bpmB);
@@ -106,15 +104,12 @@ function computeAcousticDistance(vecA, vecB) {
   const centroidDiff = Math.abs(vecA[2] - vecB[2]);
   const pulseDiff = Math.abs(vecA[3] - vecB[3]);
 
-  // Perceptual weights: Energy & Tempo govern flow most strongly
-  const weightedDist = Math.sqrt(
+  return Math.sqrt(
     Math.pow(minBpmDiff, 2) * 0.35 +
     Math.pow(rmsDiff, 2) * 0.35 +
     Math.pow(centroidDiff, 2) * 0.12 +
     Math.pow(pulseDiff, 2) * 0.18
   );
-
-  return weightedDist;
 }
 
 function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
@@ -140,13 +135,11 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
   const curArtist = (currentTrack?.artist || '').toLowerCase().trim();
   const curVector = currentTrack?.audio_vector;
 
-  // Track recent artist count to prevent artist flooding
   const recentArtistCount = recentIds.slice(-4).reduce((cnt, id) => {
     const item = tracks.find((x) => x.id === id);
     return item && item.artist?.toLowerCase().trim() === curArtist ? cnt + 1 : cnt;
   }, 0);
 
-  // 12% probability of gentle genre exploratory jump
   const jumpGenre = Math.random() < 0.12;
 
   const scored = pool.map(({ t, idx }) => {
@@ -157,43 +150,45 @@ function pickSmartNextIndex(tracks, currentTrack, recentIds = []) {
 
     let score = 0;
 
-    // 1. Acoustic similarity (0.0 to 12.0)
     if (curVector && t.audio_vector) {
       const dist = computeAcousticDistance(curVector, t.audio_vector);
-      // dist is usually between 0.02 and 0.60
       score += Math.max(0, (0.75 - dist) * 16.0);
+
+      // --- STRICT MOOD GATES (Fixes the Sad Song -> Phonk Bug) ---
+      const energyDiff = Math.abs(curVector[1] - t.audio_vector[1]);
+      const centroidDiff = Math.abs(curVector[2] - t.audio_vector[2]);
+      
+      if (energyDiff > 0.35) {
+        score -= 15.0; // Severe penalty for massive energy shift
+      }
+      if (centroidDiff > 0.40) {
+        score -= 10.0; // Severe penalty for massive tone/brightness shift
+      }
     } else {
       score += 5.0;
     }
 
-    // 2. Genre Continuity
     if (!jumpGenre && isSameGenre) {
       score += 7.0;
     } else if (jumpGenre && !isSameGenre) {
       score += 5.5;
     }
 
-    // 3. Artist Affinity vs Overplay dampening
     if (isSameArtist) {
       if (recentArtistCount >= 1) {
-        score -= 2.0; // avoid 3 in a row by same artist
+        score -= 2.0;
       } else {
         score += 2.8;
       }
     }
 
-    // 4. Subtle human-like jitter
     score += Math.random() * 1.2;
-
     return { idx, score };
   });
 
   scored.sort((a, b) => b.score - a.score);
-
-  // Take top 3 closest matches and pick using softmax-style weighting
   const topCluster = scored.slice(0, Math.min(3, scored.length));
   const chosen = topCluster[Math.floor(Math.random() * topCluster.length)];
-
   return chosen.idx;
 }
 
@@ -205,6 +200,7 @@ export default function App() {
   );
 }
 
+// Wrapped in memo with strict dependency tracking to eliminate FlatList UI lag
 const TrackRowItem = memo(({ item, isSelected, isPlaying, onSelect }) => {
   return (
     <TouchableOpacity
@@ -245,6 +241,10 @@ const TrackRowItem = memo(({ item, isSelected, isPlaying, onSelect }) => {
       )}
     </TouchableOpacity>
   );
+}, (prev, next) => {
+  return prev.item.id === next.item.id && 
+         prev.isSelected === next.isSelected && 
+         prev.isPlaying === next.isPlaying;
 });
 
 const SpeedDialSection = memo(({ pages, currentTrackId, onSelect }) => {
@@ -337,6 +337,21 @@ function AppContent() {
   const recentIdsRef = useRef([]);
   const backStackRef = useRef([]);
 
+  // Transition & Loop Guards
+  const isTransitioningRef = useRef(false);
+  const shouldAutoplayRef = useRef(false);
+  const currentIndexRef = useRef(currentIndex);
+  const rawTracksRef = useRef(rawTracks);
+  const activeTrackLoadedRef = useRef(false);
+
+  useEffect(() => {
+    currentIndexRef.current = currentIndex;
+  }, [currentIndex]);
+
+  useEffect(() => {
+    rawTracksRef.current = rawTracks;
+  }, [rawTracks]);
+
   const currentTrack = currentIndex !== null && rawTracks[currentIndex] ? rawTracks[currentIndex] : null;
 
   const audioSource = useMemo(() => {
@@ -347,7 +362,6 @@ function AppContent() {
   const player = useAudioPlayer(audioSource);
   const status = useAudioPlayerStatus(player);
 
-  // Debounce search query to keep typing responsive
   useEffect(() => {
     const handler = setTimeout(() => {
       setDebouncedSearch(searchQuery);
@@ -361,7 +375,7 @@ function AppContent() {
       staysActiveInBackground: true,
       shouldPlayInBackground: true,
       interruptionMode: 'doNotMix',
-    }).catch((err) => console.warn('Audio mode config failed:', err));
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -401,6 +415,7 @@ function AppContent() {
     setCurrentLineIndex(-1);
     setSmoothTime(0);
     scrollY.setValue(0);
+    activeTrackLoadedRef.current = false;
 
     if (!currentTrack || !currentTrack.lrc) {
       setLyrics([]);
@@ -410,8 +425,7 @@ function AppContent() {
     fetch(`${HF_BASE_URL}/${currentTrack.lrc}`)
       .then((res) => res.text())
       .then((lrcText) => setLyrics(parseLRC(lrcText)))
-      .catch((err) => {
-        console.error('Failed to load LRC lyrics:', err);
+      .catch(() => {
         setLyrics([]);
       });
   }, [currentTrack?.id]);
@@ -435,9 +449,7 @@ function AppContent() {
         if (cancelled || !result?.base64) return;
         setColorProbeDataUri(`data:image/jpeg;base64,${result.base64}`);
       })
-      .catch((err) => {
-        console.warn('Cover download/resize failed, using fallback theme:', err);
-      });
+      .catch(() => {});
 
     return () => {
       cancelled = true;
@@ -455,7 +467,6 @@ function AppContent() {
 
   const colorProbeHtml = colorProbeDataUri ? buildColorProbeHtml(colorProbeDataUri) : null;
 
-  // Ultra-smooth audio time sync without thread contention
   useEffect(() => {
     if (fastTimer.current) clearInterval(fastTimer.current);
 
@@ -464,6 +475,11 @@ function AppContent() {
       try {
         const t = player.currentTime ?? status?.currentTime ?? 0;
         setSmoothTime(t);
+        // Mark as actively progressing once past first 0.5s of audio
+        if (t > 0.5) {
+          activeTrackLoadedRef.current = true;
+          isTransitioningRef.current = false;
+        }
       } catch (err) {}
     }, 250);
 
@@ -498,91 +514,163 @@ function AppContent() {
     }
   }, [smoothTime, lyrics]);
 
-  const advancedRef = useRef(false);
-  const shouldAutoplayRef = useRef(false);
-
+  // Guaranteed autoplay execution whenever source updates
   useEffect(() => {
-    advancedRef.current = false;
-  }, [currentTrack?.id]);
+    if (!player || !currentTrack || !shouldAutoplayRef.current) return;
 
-  useEffect(() => {
-    if (!player || !status || !shouldAutoplayRef.current || !currentTrack) return;
-    if (status.isLoaded && !status.isPlaying) {
+    let mounted = true;
+    const tryPlay = () => {
+      if (!mounted) return;
       try {
         player.play();
         shouldAutoplayRef.current = false;
-      } catch (err) {}
-    }
-  }, [player, status?.isLoaded, status?.isPlaying, currentTrack]);
+      } catch (e) {}
+    };
 
-  useEffect(() => {
-    if (!status || advancedRef.current || !duration || currentIndex === null) return;
-    const finished =
-      status.didJustFinish === true ||
-      (smoothTime >= duration - 0.3 && status.isPlaying === false && smoothTime > 1);
-    if (finished) {
-      advancedRef.current = true;
-      playNext();
+    if (status?.isLoaded) {
+      tryPlay();
+    } else {
+      const timer = setTimeout(tryPlay, 100);
+      return () => {
+        mounted = false;
+        clearTimeout(timer);
+      };
     }
-  }, [status?.didJustFinish, status?.isPlaying, smoothTime, duration, currentIndex]);
+  }, [player, status?.isLoaded, currentTrack]);
+
+  const playNext = useCallback(() => {
+    const list = rawTracksRef.current;
+    const curIdx = currentIndexRef.current;
+    if (!list.length || curIdx === null || isTransitioningRef.current) return;
+
+    isTransitioningRef.current = true;
+    activeTrackLoadedRef.current = false;
+
+    const current = list[curIdx];
+    if (current) {
+      recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
+      backStackRef.current = [...backStackRef.current, curIdx].slice(-50);
+    }
+
+    const nextIdx = pickSmartNextIndex(list, current, recentIdsRef.current);
+    shouldAutoplayRef.current = true;
+    setCurrentIndex(nextIdx >= 0 ? nextIdx : (curIdx + 1) % list.length);
+
+    setTimeout(() => {
+      isTransitioningRef.current = false;
+    }, 400); // Shorter lock timeout for snappier manual skips
+  }, []);
+
+  const playPrev = useCallback(() => {
+    const list = rawTracksRef.current;
+    const curIdx = currentIndexRef.current;
+    if (!list.length || curIdx === null || isTransitioningRef.current) return;
+
+    isTransitioningRef.current = true;
+    activeTrackLoadedRef.current = false;
+
+    const prevIdx = backStackRef.current.length ? backStackRef.current.pop() : undefined;
+    shouldAutoplayRef.current = true;
+    if (prevIdx !== undefined && prevIdx !== curIdx) {
+      setCurrentIndex(prevIdx);
+    } else {
+      setCurrentIndex((curIdx - 1 + list.length) % list.length);
+    }
+
+    setTimeout(() => {
+      isTransitioningRef.current = false;
+    }, 400);
+  }, []);
 
   const togglePlayPause = useCallback(() => {
-    if (!player || currentIndex === null) return;
+    if (!player || currentIndexRef.current === null) return;
     try {
       if (player.playing || status?.isPlaying) {
         player.pause();
       } else {
         player.play();
       }
-    } catch (err) {
-      console.warn('Play/pause failed:', err);
-    }
-  }, [player, status?.isPlaying, currentIndex]);
+    } catch (err) {}
+  }, [player, status?.isPlaying]);
 
-  const playNext = useCallback(() => {
-    if (!rawTracks.length || currentIndex === null) return;
-    const current = rawTracks[currentIndex];
-    if (current) {
-      recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
-      backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
-    }
-    const nextIdx = pickSmartNextIndex(rawTracks, current, recentIdsRef.current);
-    shouldAutoplayRef.current = true;
-    setCurrentIndex(nextIdx >= 0 ? nextIdx : (currentIndex + 1) % rawTracks.length);
-  }, [rawTracks, currentIndex]);
+  const playNextRef = useRef(playNext);
+  const playPrevRef = useRef(playPrev);
+  const togglePlayPauseRef = useRef(togglePlayPause);
 
-  const playPrev = useCallback(() => {
-    if (!rawTracks.length || currentIndex === null) return;
-    const prevIdx = backStackRef.current.length ? backStackRef.current.pop() : undefined;
-    shouldAutoplayRef.current = true;
-    if (prevIdx !== undefined && prevIdx !== currentIndex) {
-      setCurrentIndex(prevIdx);
-    } else {
-      setCurrentIndex((currentIndex - 1 + rawTracks.length) % rawTracks.length);
-    }
-  }, [rawTracks, currentIndex]);
+  useEffect(() => {
+    playNextRef.current = playNext;
+    playPrevRef.current = playPrev;
+    togglePlayPauseRef.current = togglePlayPause;
+  });
+
+  // Native Background Event Listener for Track End
+  useEffect(() => {
+    if (!player || typeof player.addListener !== 'function') return;
+
+    const subs = [];
+    const handlePlaybackState = (s) => {
+      if (!s || isTransitioningRef.current || !activeTrackLoadedRef.current) return;
+
+      const dur = s.duration || 0;
+      const cur = s.currentTime || 0;
+
+      const isEnded =
+        s.didJustFinish === true ||
+        s.isFinished === true ||
+        (dur > 0 && cur >= dur - 0.35 && cur > 2 && s.isPlaying === false);
+
+      if (isEnded) {
+        playNextRef.current();
+      }
+    };
+
+    try {
+      const statusSub = player.addListener('playbackStatusUpdate', handlePlaybackState);
+      if (statusSub) subs.push(statusSub);
+    } catch (e) {}
+
+    try {
+      const endSub = player.addListener('playbackEnded', () => {
+        if (!isTransitioningRef.current && activeTrackLoadedRef.current) {
+          playNextRef.current();
+        }
+      });
+      if (endSub) subs.push(endSub);
+    } catch (e) {}
+
+    return () => {
+      subs.forEach((s) => {
+        try { s?.remove?.(); } catch (e) {}
+      });
+    };
+  }, [player]);
 
   const selectTrackById = useCallback((trackId) => {
     setRawTracks((currentRaw) => {
       const targetIdx = currentRaw.findIndex((t) => t.id === trackId);
       if (targetIdx !== -1) {
-        if (currentIndex !== null && currentRaw[currentIndex]) {
-          const current = currentRaw[currentIndex];
+        if (currentIndexRef.current !== null && currentRaw[currentIndexRef.current]) {
+          const current = currentRaw[currentIndexRef.current];
           recentIdsRef.current = [...recentIdsRef.current, current.id].slice(-RECENT_HISTORY_LIMIT);
-          backStackRef.current = [...backStackRef.current, currentIndex].slice(-50);
+          backStackRef.current = [...backStackRef.current, currentIndexRef.current].slice(-50);
         }
+        isTransitioningRef.current = false;
+        activeTrackLoadedRef.current = false;
         shouldAutoplayRef.current = true;
         setCurrentIndex(targetIdx);
         setPlayerOpen(true);
       }
       return currentRaw;
     });
-  }, [currentIndex]);
+  }, []);
 
   const duration = status?.duration || 0;
   const displayTime = seeking ? seekValue : smoothTime;
   const progressPct = duration > 0 ? Math.min(displayTime / duration, 1) : 0;
   const isPlaying = status?.isPlaying ?? player?.playing ?? false;
+  
+  // Buffering indicator state to prevent UI feeling laggy
+  const isBuffering = !status?.isLoaded || status?.isBuffering;
 
   const nowPlayingTheme = useMemo(() => {
     const top = darkenColor(dominantColor, 0.45);
@@ -636,6 +724,7 @@ function AppContent() {
     }
   }, [rawTracks]);
 
+  // Lockscreen controls & persistent background notification
   useEffect(() => {
     if (!player || !status?.isLoaded || !currentTrack) return;
     try {
@@ -647,40 +736,47 @@ function AppContent() {
           artworkUrl: currentTrack.cover ? `${HF_BASE_URL}/${currentTrack.cover}` : undefined,
         },
         {
-          showNextTrack: true,
-          showPreviousTrack: true,
+          showSeekForward: true,
+          showSeekBackward: true,
         }
-      );
+      ).catch(() => {});
     } catch (err) {}
   }, [player, status?.isLoaded, currentTrack?.id]);
 
-  // Headset & Remote Control Gestures
+  // Bluetooth earphone controls
   useEffect(() => {
     if (!player || typeof player.addListener !== 'function') return;
 
-    const nextSub = player.addListener('onRemoteNextTrack', () => playNext());
-    const skipNextSub = player.addListener('onRemoteSkipToNext', () => playNext());
-    const prevSub = player.addListener('onRemotePreviousTrack', () => playPrev());
-    const skipPrevSub = player.addListener('onRemoteSkipToPrevious', () => playPrev());
+    const subscriptions = [];
+    const addSafe = (eventName, callback) => {
+      try {
+        const sub = player.addListener(eventName, callback);
+        if (sub) subscriptions.push(sub);
+      } catch (e) {}
+    };
 
-    const playSub = player.addListener('onRemotePlay', () => {
+    addSafe('onRemoteNextTrack', () => playNextRef.current());
+    addSafe('onRemoteSkipToNext', () => playNextRef.current());
+    addSafe('seekForward', () => playNextRef.current());
+
+    addSafe('onRemotePreviousTrack', () => playPrevRef.current());
+    addSafe('onRemoteSkipToPrevious', () => playPrevRef.current());
+    addSafe('seekBackward', () => playPrevRef.current());
+
+    addSafe('onRemotePlay', () => {
       try { player.play(); } catch (e) {}
     });
-    const pauseSub = player.addListener('onRemotePause', () => {
+    addSafe('onRemotePause', () => {
       try { player.pause(); } catch (e) {}
     });
-    const toggleSub = player.addListener('onRemoteTogglePlayPause', () => togglePlayPause());
+    addSafe('onRemoteTogglePlayPause', () => togglePlayPauseRef.current());
 
     return () => {
-      nextSub?.remove?.();
-      skipNextSub?.remove?.();
-      prevSub?.remove?.();
-      skipPrevSub?.remove?.();
-      playSub?.remove?.();
-      pauseSub?.remove?.();
-      toggleSub?.remove?.();
+      subscriptions.forEach((sub) => {
+        try { sub?.remove?.(); } catch (e) {}
+      });
     };
-  }, [player, playNext, playPrev, togglePlayPause]);
+  }, [player]);
 
   const handleSeekBarPress = (evt) => {
     if (!duration || !player) return;
@@ -703,14 +799,17 @@ function AppContent() {
     index,
   }), []);
 
-  const renderItem = useCallback(({ item }) => (
-    <TrackRowItem
-      item={item}
-      isSelected={currentTrack?.id === item.id}
-      isPlaying={isPlaying}
-      onSelect={selectTrackById}
-    />
-  ), [currentTrack?.id, isPlaying, selectTrackById]);
+  const renderItem = useCallback(({ item }) => {
+    const isSel = currentTrack?.id === item.id;
+    return (
+      <TrackRowItem
+        item={item}
+        isSelected={isSel}
+        isPlaying={isSel ? isPlaying : false} // Prevents thousands of re-renders per second
+        onSelect={selectTrackById}
+      />
+    );
+  }, [currentTrack?.id, isPlaying, selectTrackById]);
 
   const listHeader = useMemo(() => (
     <View>
@@ -866,7 +965,11 @@ function AppContent() {
               hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
               style={styles.miniPlayBtn}
             >
-              <Ionicons name={isPlaying ? 'pause' : 'play'} size={22} color={COLORS.white} />
+              {isBuffering ? (
+                <ActivityIndicator size="small" color={COLORS.white} />
+              ) : (
+                <Ionicons name={isPlaying ? 'pause' : 'play'} size={22} color={COLORS.white} />
+              )}
             </TouchableOpacity>
           </View>
         </TouchableOpacity>
@@ -941,12 +1044,16 @@ function AppContent() {
                   <Ionicons name="play-skip-back" size={30} color={COLORS.white} />
                 </TouchableOpacity>
                 <TouchableOpacity onPress={togglePlayPause} style={styles.playPauseCircle} activeOpacity={0.85}>
-                  <Ionicons
-                    name={isPlaying ? 'pause' : 'play'}
-                    size={30}
-                    color={COLORS.bg}
-                    style={{ marginLeft: isPlaying ? 0 : 3 }}
-                  />
+                  {isBuffering ? (
+                    <ActivityIndicator size="small" color={COLORS.bg} />
+                  ) : (
+                    <Ionicons
+                      name={isPlaying ? 'pause' : 'play'}
+                      size={30}
+                      color={COLORS.bg}
+                      style={{ marginLeft: isPlaying ? 0 : 3 }}
+                    />
+                  )}
                 </TouchableOpacity>
                 <TouchableOpacity onPress={playNext} hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
                   <Ionicons name="play-skip-forward" size={30} color={COLORS.white} />
@@ -1224,7 +1331,6 @@ const styles = StyleSheet.create({
   headerRow: { paddingHorizontal: PADDING_H, paddingTop: 16, paddingBottom: 12 },
   headerTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 24, letterSpacing: -0.4 },
 
-  // Speed Dial
   speedDialContainer: { marginBottom: 14 },
   speedDialScroll: { marginBottom: 4 },
   speedDialPage: {
@@ -1276,7 +1382,6 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 
-  // Filter Bar
   filterBar: { paddingHorizontal: PADDING_H, paddingVertical: 8, gap: 10 },
   filterPill: {
     backgroundColor: COLORS.surface,
@@ -1300,7 +1405,6 @@ const styles = StyleSheet.create({
     fontFamily: 'Poppins_700Bold',
   },
 
-  // Minimal Search Box
   searchContainer: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1325,7 +1429,6 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
   },
 
-  // Section Header
   sectionHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1337,7 +1440,6 @@ const styles = StyleSheet.create({
   sectionTitle: { color: COLORS.white, fontFamily: 'Poppins_700Bold', fontSize: 19, letterSpacing: -0.3 },
   songCountText: { color: COLORS.grayDim, fontFamily: 'Poppins_500Medium', fontSize: 12 },
 
-  // Track List Item
   trackRow: {
     height: ITEM_HEIGHT,
     flexDirection: 'row',
@@ -1379,7 +1481,6 @@ const styles = StyleSheet.create({
   indicatorWrap: { marginLeft: 10 },
   nowPlayingDotPulse: { width: 8, height: 8, borderRadius: 4, backgroundColor: COLORS.green },
 
-  // See More Button
   seeMoreButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1398,7 +1499,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
 
-  // Floating Mini Player
   miniPlayer: {
     position: 'absolute',
     left: 12,
@@ -1442,7 +1542,6 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
 
-  // Full Player
   fullPlayer: { flex: 1, backgroundColor: COLORS.bg, paddingHorizontal: 24 },
   fullPlayerHeader: {
     flexDirection: 'row',
@@ -1550,7 +1649,6 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
 
-  // Lyrics Card
   lyricsBoxCard: {
     marginTop: 30,
     borderRadius: 16,
@@ -1602,7 +1700,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
 
-  // Full Expanded Lyrics Modal
   expandedLyricsContainer: {
     flex: 1,
     backgroundColor: COLORS.bg,
